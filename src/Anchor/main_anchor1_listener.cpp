@@ -19,7 +19,7 @@
 #define IS_LISTENER         true    // Set true on ONE anchor (the one connected to computer)
 
 // Must match tag firmware
-#define NUM_ANCHORS         1       // Total anchors in system (for parsing broadcast)
+#define NUM_ANCHORS         4       // Total anchors in system (for parsing broadcast)
 #define FIRST_ANCHOR_ID     1
 
 // Hardware pins

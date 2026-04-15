@@ -5,7 +5,7 @@
 #define CHIP_SELECT_PIN 4
 
 // Set to 1 for Anchor 1, 2 for Anchor 2
-#define ANCHOR_ID 1
+#define ANCHOR_ID 4
 #define RESPONSE_TIMEOUT_MS 10 // Maximum time to wait for a response
 unsigned long last_ranging_time = 0;
 #define MAX_RETRIES 3
