@@ -1,37 +1,41 @@
 // ============================================================
-//  UWB Spatial Tracking - TAG Firmware
-//  Architecture: Tag-initiated DS-TWR with broadcast to listener
+//  UWB Spatial Tracking - TAG Firmware (Multi-Tag TDMA)
 //
-//  The tag sequentially ranges with each anchor, computes
-//  distances, then broadcasts all distances in a single UWB
-//  frame to the listener anchor. The listener outputs CSV
-//  over serial for trilateration on a computer.
+//  Tags are powered externally (USB/battery). They:
+//    1. Range with each anchor via DS-TWR
+//    2. Broadcast all distances in one UWB frame to anchor 1
+//    3. Anchor 1 (listener) outputs CSV over serial to computer
 //
-//  To scale: just change NUM_ANCHORS. Anchor IDs are
-//  sequential starting from FIRST_ANCHOR_ID.
+//  FLASH: Same file for all tags. Set TAG_ID via build_flags.
+//  SYSTEM CONFIG must match across all devices.
 // ============================================================
 
 #include <Arduino.h>
 #include <SPI.h>
 
 // ==================== CONFIGURATION ====================
-// Change these to match your setup
 
-#define TAG_ID              10
-#define NUM_ANCHORS         1       // Number of anchors to range with (change to 3, 4, etc.)
-#define FIRST_ANCHOR_ID     1       // Anchors are numbered 1, 2, 3, ...
-#define LISTENER_ANCHOR_ID  1       // Which anchor receives the broadcast (typically anchor 1)
+#ifndef TAG_ID
+#define TAG_ID              8
+#endif
 
-// Hardware pins
+#define NUM_ANCHORS         4
+#define FIRST_ANCHOR_ID     1
+#define LISTENER_ANCHOR_ID  1
+#define NUM_TAGS            3
+#define FIRST_TAG_ID        8
+
 #define RST_PIN             27
 #define CHIP_SELECT_PIN     4
 
-// Ranging tuning
-#define FILTER_SIZE         5       // Median filter window
-#define MIN_DISTANCE        0.0     // cm
-#define MAX_DISTANCE        2000.0  // cm
-#define RX_TIMEOUT          5000    // Loop iterations before retry
-#define INTER_RANGE_DELAY   5       // ms between ranging cycles
+#define RX_TIMEOUT_MS       10
+#define INTER_RANGE_DELAY   2
+#define SLOT_DURATION_MS    100
+#define MAX_RANGE_RETRIES   1
+
+#define FILTER_SIZE         5
+#define MIN_DISTANCE        0.0
+#define MAX_DISTANCE        2000.0
 
 // ==================== UWB CONSTANTS ====================
 
@@ -55,11 +59,8 @@
 #define CLOCK_OFFSET_CHAN_9_CONSTANT -0.1252e-3f
 #define PS_UNIT 15.6500400641025641
 #define SPEED_OF_LIGHT 0.029979245800
-#define TRANSMIT_DELAY 0x3B9ACA00
-#define TRANSMIT_DIFF 0x1FF
 #define NO_OFFSET 0x0
 
-// Register addresses
 #define GEN_CFG_AES_LOW_REG 0x00
 #define GEN_CFG_AES_HIGH_REG 0x01
 #define STS_CFG_REG 0x2
@@ -71,12 +72,10 @@
 #define AON_REG 0xA
 #define OTP_IF_REG 0xB
 #define CIA_REG1 0xC
-#define DIG_DIAG_REG 0xF
 #define PMSC_REG 0x11
 #define RX_BUFFER_0_REG 0x12
 #define TX_BUFFER_REG 0x14
 
-// Frame stages
 #define STAGE_POLL     1
 #define STAGE_RESP     2
 #define STAGE_FINAL    3
@@ -95,16 +94,14 @@ int config[] = {
     DATARATE_6_8MB, PHR_MODE_STANDARD, PHR_RATE_850KB
 };
 
-static int current_anchor_index = 0;
-static int curr_stage = 0;
-static unsigned long rx_wait_count = 0;
+static int my_slot = 0;
+static unsigned long slot_start_ms = 0;
 
-// Stats
-static unsigned long range_attempts = 0;
-static unsigned long range_successes = 0;
-static unsigned long range_timeouts = 0;
-static unsigned long range_errors = 0;
-static unsigned long bcast_successes = 0;
+static unsigned long stat_attempts = 0;
+static unsigned long stat_ok = 0;
+static unsigned long stat_timeout = 0;
+static unsigned long stat_err = 0;
+static unsigned long stat_bcast = 0;
 
 // ==================== ANCHOR DATA ====================
 
@@ -112,53 +109,61 @@ struct AnchorData {
     int anchor_id;
     int t_roundA = 0;
     int t_replyA = 0;
-    long long rx = 0;
-    long long tx = 0;
+    long long rx_ts = 0;
+    long long tx_ts = 0;
     int clock_offset = 0;
     float distance = 0;
     float distance_history[FILTER_SIZE] = {0};
     int history_index = 0;
     float filtered_distance = 0;
     float signal_strength = 0;
-    float fp_signal_strength = 0;
 };
 
 AnchorData anchors[NUM_ANCHORS];
 
-void initializeAnchors() {
+void initAnchors() {
     for (int i = 0; i < NUM_ANCHORS; i++)
         anchors[i].anchor_id = FIRST_ANCHOR_ID + i;
 }
 
-AnchorData *getCurrentAnchor()  { return &anchors[current_anchor_index]; }
-int getCurrentAnchorId()        { return anchors[current_anchor_index].anchor_id; }
-void advanceToNextAnchor()      { current_anchor_index = (current_anchor_index + 1) % NUM_ANCHORS; }
-
 // ==================== FILTERING ====================
 
-bool isValidDistance(float d) {
-    return (d >= MIN_DISTANCE && d <= MAX_DISTANCE);
-}
-
-float calculateMedian(float arr[], int size) {
-    float temp[size];
-    for (int i = 0; i < size; i++) temp[i] = arr[i];
+float calcMedian(float arr[], int size) {
+    float tmp[size];
+    for (int i = 0; i < size; i++) tmp[i] = arr[i];
     for (int i = 0; i < size - 1; i++)
         for (int j = i + 1; j < size; j++)
-            if (temp[j] < temp[i]) { float t = temp[i]; temp[i] = temp[j]; temp[j] = t; }
-    return (size % 2 == 0) ? (temp[size/2 - 1] + temp[size/2]) / 2.0 : temp[size/2];
+            if (tmp[j] < tmp[i]) { float t = tmp[i]; tmp[i] = tmp[j]; tmp[j] = t; }
+    return (size % 2 == 0) ? (tmp[size/2 - 1] + tmp[size/2]) / 2.0 : tmp[size/2];
 }
 
-void updateFilteredDistance(AnchorData &data) {
-    data.distance_history[data.history_index] = data.distance;
-    data.history_index = (data.history_index + 1) % FILTER_SIZE;
+void updateFilter(AnchorData &a) {
+    a.distance_history[a.history_index] = a.distance;
+    a.history_index = (a.history_index + 1) % FILTER_SIZE;
     float valid[FILTER_SIZE];
-    int count = 0;
+    int cnt = 0;
     for (int i = 0; i < FILTER_SIZE; i++)
-        if (isValidDistance(data.distance_history[i]))
-            valid[count++] = data.distance_history[i];
-    data.filtered_distance = (count > 0) ? calculateMedian(valid, count) : 0;
+        if (a.distance_history[i] >= MIN_DISTANCE && a.distance_history[i] <= MAX_DISTANCE)
+            valid[cnt++] = a.distance_history[i];
+    a.filtered_distance = (cnt > 0) ? calcMedian(valid, cnt) : 0;
 }
+
+// ==================== TDMA ====================
+
+void waitForSlot() {
+    unsigned long cycle = (unsigned long)NUM_TAGS * SLOT_DURATION_MS;
+    unsigned long now = millis();
+    unsigned long pos = now % cycle;
+    unsigned long my_start = (unsigned long)my_slot * SLOT_DURATION_MS;
+    unsigned long wait = 0;
+    if (pos <= my_start) wait = my_start - pos;
+    else if (pos < my_start + SLOT_DURATION_MS) wait = 0;
+    else wait = cycle - pos + my_start;
+    if (wait > 0) delay(wait);
+    slot_start_ms = millis();
+}
+
+bool slotExpired() { return (millis() - slot_start_ms) >= SLOT_DURATION_MS; }
 
 // ==================== DWM3000 DRIVER ====================
 
@@ -169,48 +174,32 @@ public:
     static void writeSysConfig();
     static void configureAsTX();
     static void setupGPIO();
-
-    // DS-TWR frame helpers
     static void ds_sendFrame(int stage);
-    static void ds_sendRTInfo(int t_roundB, int t_replyB);
-    static int  ds_processRTInfo(int t_roundA, int t_replyA, int t_roundB, int t_replyB, int clock_offset);
+    static void ds_sendRTInfo(int trB, int trpB);
+    static int  ds_processRTInfo(int trA, int trpA, int trB, int trpB, int clk);
     static int  ds_getStage();
     static bool ds_isErrorFrame();
-    static void ds_sendErrorFrame();
-
-    // Radio control
     static void setMode(int mode);
-    static void setFrameLength(int frame_len);
-    static void setTXAntennaDelay(int delay);
-    static void setSenderID(int senderID);
-    static void setDestinationID(int destID);
+    static void setFrameLength(int len);
+    static void setTXAntennaDelay(int d);
+    static void setSenderID(int s);
+    static void setDestinationID(int d);
     static int  receivedFrameSucc();
     static int  sentFrameSucc();
     static int  getSenderID();
     static int  getDestinationID();
     static bool checkForIDLE();
     static bool checkSPI();
-
-    // Diagnostics
     static double getSignalStrength();
-    static double getFirstPathSignalStrength();
-    static int    getTXAntennaDelay();
     static int    getRawClockOffset();
-    static long double getClockOffset();
-    static long double getClockOffset(int32_t ext);
-
-    // Timestamps
+    static long double getClockOffset(int32_t o);
     static unsigned long long readRXTimestamp();
     static unsigned long long readTXTimestamp();
-
-    // SPI
-    static uint32_t write(int base, int sub, uint32_t data, int data_len);
+    static uint32_t write(int base, int sub, uint32_t data, int len);
     static uint32_t write(int base, int sub, uint32_t data);
     static uint32_t read(int base, int sub);
     static uint8_t  read8bit(int base, int sub);
     static uint32_t readOTP(uint8_t addr);
-
-    // Radio commands
     static void forceIdle();
     static void standardTX();
     static void standardRX();
@@ -218,88 +207,194 @@ public:
     static void softReset();
     static void hardReset();
     static void clearSystemStatus();
-
-    static double convertToCM(int ps_units);
-
+    static double convertToCM(int u);
 private:
     static void spiSelect(uint8_t cs);
     static void setBit(int r, int s, int sh, bool b);
-    static void setBitLow(int r, int s, int sh);
     static void setBitHigh(int r, int s, int sh);
     static void writeFastCommand(int cmd);
-    static uint32_t readOrWriteFullAddress(uint32_t base, uint32_t sub, uint32_t data, uint32_t data_len, uint32_t rw);
+    static uint32_t readOrWriteFullAddress(uint32_t base, uint32_t sub, uint32_t data, uint32_t len, uint32_t rw);
     static uint32_t sendBytes(int b[], int lenB, int recLen);
     static void clearAONConfig();
-    static unsigned int countBits(unsigned int number);
+    static unsigned int countBits(unsigned int n);
     static int checkForDevID();
 };
 
 DWM3000Class DWM3000;
 
+// ==================== FORWARD DECLARATIONS ====================
+
+bool rangeWithAnchor(int idx);
+void broadcastDistances();
+
 // ==================== BROADCAST ====================
-// Sends all distances to the listener anchor in a single UWB frame.
-// Frame layout (TX buffer offsets):
-//   0x00: frame type
-//   0x01: sender (tag ID)
-//   0x02: destination (listener anchor ID)
-//   0x03: stage = STAGE_BCAST (5)
-//   0x04 + i*2: distance[i] as uint16 (cm), for i = 0..NUM_ANCHORS-1
-//   0x04 + NUM_ANCHORS*2 + i*2: RSSI[i] as int16 (dBm*100)
+// KEY FIX: Use standardTX() for broadcast (fire-and-forget).
+// The old code used TXInstantRX() which auto-transitions to RX after TX.
+// But after the last failed ranging attempt, the radio was left in a
+// bad RX state that prevented TXInstantRX from working. standardTX()
+// just transmits and stops, which is what we want for a broadcast.
+// The listener is already in RX mode waiting.
 
 void broadcastDistances() {
-    // Force clean state
-    DWM3000.clearSystemStatus();
+    // Full reset to clean state
     DWM3000.forceIdle();
-    delayMicroseconds(50);
+    delay(2);
+    DWM3000.clearSystemStatus();
+    delay(1);
 
+    // Build the frame
     DWM3000.setMode(1);
     DWM3000.write(TX_BUFFER_REG, 0x01, TAG_ID & 0xFF);
     DWM3000.write(TX_BUFFER_REG, 0x02, LISTENER_ANCHOR_ID & 0xFF);
     DWM3000.write(TX_BUFFER_REG, 0x03, STAGE_BCAST & 0x7);
 
     for (int i = 0; i < NUM_ANCHORS; i++) {
-        uint16_t dist_cm = (uint16_t)(anchors[i].filtered_distance);
-        // MUST use explicit 2-byte write. The default write() uses countBits()
-        // which only writes 1 byte for values < 256, leaving stale data in
-        // the second byte that the anchor reads as a huge number.
-        DWM3000.write(TX_BUFFER_REG, 0x04 + (i * 2), dist_cm, 2);
+        uint16_t d = (uint16_t)(anchors[i].filtered_distance);
+        DWM3000.write(TX_BUFFER_REG, 0x04 + (i * 2), d, 2);
     }
 
     for (int i = 0; i < NUM_ANCHORS; i++) {
-        int16_t rssi_x100 = (int16_t)(anchors[i].signal_strength * 100);
-        DWM3000.write(TX_BUFFER_REG, 0x04 + (NUM_ANCHORS * 2) + (i * 2), (uint16_t)rssi_x100, 2);
+        int16_t r = (int16_t)(anchors[i].signal_strength * 100);
+        DWM3000.write(TX_BUFFER_REG, 0x04 + (NUM_ANCHORS * 2) + (i * 2), (uint16_t)r, 2);
     }
 
-    // Payload = 3 header bytes + NUM_ANCHORS * 4 bytes (2 dist + 2 rssi each)
     DWM3000.setFrameLength(3 + NUM_ANCHORS * 4);
 
-    // Use TXInstantRX (not standardTX!) - standardTX leaves radio in a
-    // dead state. TXInstantRX auto-transitions to RX after TX, same as
-    // all the DS-TWR frames that work reliably.
-    DWM3000.TXInstantRX();
+    // Clear status bits RIGHT before TX
+    DWM3000.clearSystemStatus();
 
-    bool tx_ok = false;
-    for (int i = 0; i < 200; i++) {
-        if (DWM3000.sentFrameSucc()) { tx_ok = true; break; }
-        delayMicroseconds(50);
+    // Use standardTX (not TXInstantRX) - just send and stop
+    DWM3000.standardTX();
+
+    // Poll for TX complete
+    bool ok = false;
+    unsigned long t0 = millis();
+    while ((millis() - t0) < 15) {
+        if (DWM3000.sentFrameSucc()) { ok = true; break; }
+        delayMicroseconds(100);
     }
 
-    if (tx_ok) bcast_successes++;
+    if (ok) {
+        stat_bcast++;
+        Serial.println("[BCAST] OK");
+    } else {
+        Serial.println("[BCAST] FAIL");
+    }
 
-    // Force IDLE and clear for next ranging cycle
     DWM3000.forceIdle();
-    delayMicroseconds(50);
     DWM3000.clearSystemStatus();
+}
+
+// ==================== DS-TWR RANGING ====================
+
+bool rangeWithAnchor(int idx) {
+    AnchorData *a = &anchors[idx];
+    int aid = a->anchor_id;
+
+    for (int attempt = 0; attempt <= MAX_RANGE_RETRIES; attempt++) {
+        stat_attempts++;
+        unsigned long t0;
+
+        // Step 1: Send poll
+        DWM3000.clearSystemStatus();
+        DWM3000.forceIdle();
+        delayMicroseconds(50);
+        a->t_roundA = 0;
+        a->t_replyA = 0;
+        DWM3000.setDestinationID(aid);
+        DWM3000.ds_sendFrame(STAGE_POLL);
+        a->tx_ts = DWM3000.readTXTimestamp();
+
+        // Step 2: Wait for response
+        bool got_resp = false;
+        t0 = millis();
+        while ((millis() - t0) < RX_TIMEOUT_MS) {
+            int rx = DWM3000.receivedFrameSucc();
+            if (rx == 1) {
+                DWM3000.clearSystemStatus();
+                if (!DWM3000.ds_isErrorFrame() &&
+                    DWM3000.ds_getStage() == STAGE_RESP &&
+                    DWM3000.getSenderID() == aid) {
+                    got_resp = true;
+                } else { stat_err++; }
+                break;
+            } else if (rx == 2) {
+                DWM3000.clearSystemStatus();
+                stat_err++;
+                break;
+            }
+        }
+        if (!got_resp) {
+            stat_timeout++;
+            DWM3000.forceIdle();
+            DWM3000.clearSystemStatus();
+            continue;
+        }
+
+        // Step 3: Send final
+        a->rx_ts = DWM3000.readRXTimestamp();
+        DWM3000.ds_sendFrame(STAGE_FINAL);
+        a->t_roundA = a->rx_ts - a->tx_ts;
+        a->tx_ts = DWM3000.readTXTimestamp();
+        a->t_replyA = a->tx_ts - a->rx_ts;
+
+        // Step 4: Wait for report
+        bool got_report = false;
+        t0 = millis();
+        while ((millis() - t0) < RX_TIMEOUT_MS) {
+            int rx = DWM3000.receivedFrameSucc();
+            if (rx == 1) {
+                DWM3000.clearSystemStatus();
+                if (!DWM3000.ds_isErrorFrame() &&
+                    DWM3000.ds_getStage() == STAGE_REPORT &&
+                    DWM3000.getSenderID() == aid) {
+                    a->clock_offset = DWM3000.getRawClockOffset();
+                    got_report = true;
+                } else { stat_err++; }
+                break;
+            } else if (rx == 2) {
+                DWM3000.clearSystemStatus();
+                stat_err++;
+                break;
+            }
+        }
+        if (!got_report) {
+            stat_timeout++;
+            DWM3000.forceIdle();
+            DWM3000.clearSystemStatus();
+            continue;
+        }
+
+        // Step 5: Compute distance
+        int tof = DWM3000.ds_processRTInfo(
+            a->t_roundA, a->t_replyA,
+            DWM3000.read(RX_BUFFER_0_REG, 0x04),
+            DWM3000.read(RX_BUFFER_0_REG, 0x08),
+            a->clock_offset);
+
+        a->distance = DWM3000.convertToCM(tof);
+        a->signal_strength = DWM3000.getSignalStrength();
+        updateFilter(*a);
+        stat_ok++;
+
+        Serial.print("[DIST] A"); Serial.print(aid);
+        Serial.print(": "); Serial.print(a->filtered_distance, 1);
+        Serial.println("cm");
+
+        DWM3000.forceIdle();
+        DWM3000.clearSystemStatus();
+        return true;
+    }
+
+    DWM3000.forceIdle();
+    DWM3000.clearSystemStatus();
+    return false;
 }
 
 // ==================== DWM3000 IMPLEMENTATIONS ====================
 
 void DWM3000Class::spiSelect(uint8_t cs) { pinMode(cs, OUTPUT); digitalWrite(cs, HIGH); delay(5); }
-
-void DWM3000Class::begin() {
-    delay(5); pinMode(CHIP_SELECT_PIN, OUTPUT); SPI.begin(); delay(5);
-    spiSelect(CHIP_SELECT_PIN);
-}
+void DWM3000Class::begin() { delay(5); pinMode(CHIP_SELECT_PIN, OUTPUT); SPI.begin(); delay(5); spiSelect(CHIP_SELECT_PIN); }
 
 void DWM3000Class::init() {
     if (!checkForDevID()) { Serial.println("[ERROR] Dev ID wrong!"); return; }
@@ -313,7 +408,8 @@ void DWM3000Class::init() {
     int xtrim = readOTP(0x1E); xtrim = xtrim == 0 ? 0x2E : xtrim;
     write(FS_CTRL_REG, 0x14, xtrim);
     writeSysConfig();
-    write(0x00, 0x3C, 0xFFFFFFFF); write(0x00, 0x40, 0xFFFF); write(0x0A, 0x00, 0x000900, 3);
+    write(0x00, 0x3C, 0xFFFFFFFF); write(0x00, 0x40, 0xFFFF);
+    write(0x0A, 0x00, 0x000900, 3);
     write(0x3, 0x1C, 0x10000240); write(0x3, 0x20, 0x1B6DA489);
     write(0x3, 0x38, 0x0001C0FD); write(0x3, 0x3C, 0x0001C43E);
     write(0x3, 0x40, 0x0001C6BE); write(0x3, 0x44, 0x0001C77E);
@@ -394,69 +490,28 @@ void DWM3000Class::ds_sendRTInfo(int trB, int trpB) {
     TXInstantRX();
 }
 
-int DWM3000Class::ds_processRTInfo(int t_rA, int t_rpA, int t_rB, int t_rpB, int clk) {
-    int reply_diff = t_rpA - t_rpB;
-    long double co = t_rpA > t_rpB ? 1.0 + getClockOffset(clk) : 1.0 - getClockOffset(clk);
-    int first_rt = t_rA - t_rpB;
-    int second_rt = t_rB - t_rpA;
-    return (first_rt + second_rt - (reply_diff - (reply_diff * co))) / 4;
+int DWM3000Class::ds_processRTInfo(int trA, int trpA, int trB, int trpB, int clk) {
+    int reply_diff = trpA - trpB;
+    long double co = trpA > trpB ? 1.0 + getClockOffset(clk) : 1.0 - getClockOffset(clk);
+    return (trA - trpB + trB - trpA - (reply_diff - (reply_diff * co))) / 4;
 }
 
 int  DWM3000Class::ds_getStage()     { return read(RX_BUFFER_0_REG, 0x03) & 0b111; }
 bool DWM3000Class::ds_isErrorFrame() { return ((read(RX_BUFFER_0_REG, 0x00) & 0x7) == 7); }
-void DWM3000Class::ds_sendErrorFrame() { setMode(7); setFrameLength(3); standardTX(); }
-
 void DWM3000Class::setMode(int mode) { write(TX_BUFFER_REG, 0x00, mode & 0x7); }
-void DWM3000Class::setFrameLength(int len) {
-    len += FCS_LEN;
-    int cfg = read(0x00, 0x24);
-    write(GEN_CFG_AES_LOW_REG, 0x24, (cfg & 0xFFFFFC00) | len);
-}
+void DWM3000Class::setFrameLength(int len) { len += FCS_LEN; int cfg = read(0x00, 0x24); write(GEN_CFG_AES_LOW_REG, 0x24, (cfg & 0xFFFFFC00) | len); }
 void DWM3000Class::setTXAntennaDelay(int d) { ANTENNA_DELAY = d; write(0x01, 0x04, d); }
-void DWM3000Class::setSenderID(int s)       { sender = s; }
-void DWM3000Class::setDestinationID(int d)  { destination = d; }
-
-int DWM3000Class::receivedFrameSucc() {
-    int s = read(GEN_CFG_AES_LOW_REG, 0x44);
-    if (s & SYS_STATUS_FRAME_RX_SUCC) return 1;
-    if (s & SYS_STATUS_RX_ERR) return 2;
-    return 0;
-}
-
-int  DWM3000Class::sentFrameSucc()   { return (read(GEN_CFG_AES_LOW_REG, 0x44) & SYS_STATUS_FRAME_TX_SUCC) ? 1 : 0; }
-int  DWM3000Class::getSenderID()     { return read(RX_BUFFER_0_REG, 0x01) & 0xFF; }
-int  DWM3000Class::getDestinationID(){ return read(RX_BUFFER_0_REG, 0x02) & 0xFF; }
-bool DWM3000Class::checkForIDLE() {
-    return ((read(0x0F, 0x30) >> 16) & PMSC_STATE_IDLE) == PMSC_STATE_IDLE ||
-           ((read(0x00, 0x44) >> 16) & (SPIRDY_MASK | RCINIT_MASK)) == (SPIRDY_MASK | RCINIT_MASK);
-}
+void DWM3000Class::setSenderID(int s) { sender = s; }
+void DWM3000Class::setDestinationID(int d) { destination = d; }
+int DWM3000Class::receivedFrameSucc() { int s = read(GEN_CFG_AES_LOW_REG, 0x44); if (s & SYS_STATUS_FRAME_RX_SUCC) return 1; if (s & SYS_STATUS_RX_ERR) return 2; return 0; }
+int  DWM3000Class::sentFrameSucc()    { return (read(GEN_CFG_AES_LOW_REG, 0x44) & SYS_STATUS_FRAME_TX_SUCC) ? 1 : 0; }
+int  DWM3000Class::getSenderID()      { return read(RX_BUFFER_0_REG, 0x01) & 0xFF; }
+int  DWM3000Class::getDestinationID() { return read(RX_BUFFER_0_REG, 0x02) & 0xFF; }
+bool DWM3000Class::checkForIDLE() { return ((read(0x0F, 0x30) >> 16) & PMSC_STATE_IDLE) == PMSC_STATE_IDLE || ((read(0x00, 0x44) >> 16) & (SPIRDY_MASK | RCINIT_MASK)) == (SPIRDY_MASK | RCINIT_MASK); }
 bool DWM3000Class::checkSPI() { return checkForDevID(); }
-
-double DWM3000Class::getSignalStrength() {
-    int cir = read(CIA_REG1, 0x2C) & 0x1FF;
-    int pac = read(CIA_REG1, 0x58) & 0xFFF;
-    unsigned int dgc = (read(RX_TUNE_REG, 0x60) >> 28) & 0x7;
-    return 10 * log10((cir * (1 << 21)) / pow(pac, 2)) + (6 * dgc) - 121.7;
-}
-
-double DWM3000Class::getFirstPathSignalStrength() {
-    float f1 = (read(CIA_REG1, 0x30) & 0x3FFFFF) >> 2;
-    float f2 = (read(CIA_REG1, 0x34) & 0x3FFFFF) >> 2;
-    float f3 = (read(CIA_REG1, 0x38) & 0x3FFFFF) >> 2;
-    int pac = read(CIA_REG1, 0x58) & 0xFFF;
-    unsigned int dgc = (read(RX_TUNE_REG, 0x60) >> 28) & 0x7;
-    return 10 * log10((f1*f1 + f2*f2 + f3*f3) / pow(pac, 2)) + (6 * dgc) - 121.7;
-}
-
-int DWM3000Class::getTXAntennaDelay() { return read(0x01, 0x04) & 0xFFFF; }
-long double DWM3000Class::getClockOffset() { return getRawClockOffset() * (config[0] == CHANNEL_5 ? CLOCK_OFFSET_CHAN_5_CONSTANT : CLOCK_OFFSET_CHAN_9_CONSTANT) / 1000000; }
+double DWM3000Class::getSignalStrength() { int cir = read(CIA_REG1, 0x2C) & 0x1FF; int pac = read(CIA_REG1, 0x58) & 0xFFF; unsigned int dgc = (read(RX_TUNE_REG, 0x60) >> 28) & 0x7; return 10 * log10((cir * (1 << 21)) / pow(pac, 2)) + (6 * dgc) - 121.7; }
+int DWM3000Class::getRawClockOffset() { int raw = read(DRX_REG, 0x29) & 0x1FFFFF; if (raw & (1 << 20)) raw |= ~((1 << 21) - 1); return raw; }
 long double DWM3000Class::getClockOffset(int32_t o) { return o * (config[0] == CHANNEL_5 ? CLOCK_OFFSET_CHAN_5_CONSTANT : CLOCK_OFFSET_CHAN_9_CONSTANT) / 1000000; }
-int DWM3000Class::getRawClockOffset() {
-    int raw = read(DRX_REG, 0x29) & 0x1FFFFF;
-    if (raw & (1 << 20)) raw |= ~((1 << 21) - 1);
-    return raw;
-}
-
 unsigned long long DWM3000Class::readRXTimestamp() { uint32_t lo = read(CIA_REG1, 0x00); unsigned long long hi = read(CIA_REG1, 0x04) & 0xFF; return (hi << 32) | lo; }
 unsigned long long DWM3000Class::readTXTimestamp() { unsigned long long lo = read(0x00, 0x74); unsigned long long hi = read(0x00, 0x78) & 0xFF; return (hi << 32) + lo; }
 uint32_t DWM3000Class::write(int base, int sub, uint32_t data, int len) { return readOrWriteFullAddress(base, sub, data, len, 1); }
@@ -464,8 +519,7 @@ uint32_t DWM3000Class::write(int base, int sub, uint32_t data) { return readOrWr
 uint32_t DWM3000Class::read(int base, int sub) { return readOrWriteFullAddress(base, sub, 0, 0, 0); }
 uint8_t  DWM3000Class::read8bit(int base, int sub) { return (uint8_t)(read(base, sub) >> 24); }
 uint32_t DWM3000Class::readOTP(uint8_t addr) { write(OTP_IF_REG, 0x04, addr); write(OTP_IF_REG, 0x08, 0x02); return read(OTP_IF_REG, 0x10); }
-
-void DWM3000Class::forceIdle()        { writeFastCommand(0x00); }  // TXRXOFF
+void DWM3000Class::forceIdle()        { writeFastCommand(0x00); }
 void DWM3000Class::standardTX()       { writeFastCommand(0x01); }
 void DWM3000Class::standardRX()       { writeFastCommand(0x02); }
 void DWM3000Class::TXInstantRX()      { writeFastCommand(0x0C); }
@@ -473,15 +527,9 @@ void DWM3000Class::softReset()        { clearAONConfig(); write(PMSC_REG, 0x04, 
 void DWM3000Class::hardReset()        { pinMode(RST_PIN, OUTPUT); digitalWrite(RST_PIN, LOW); delay(10); pinMode(RST_PIN, INPUT); }
 void DWM3000Class::clearSystemStatus(){ write(GEN_CFG_AES_LOW_REG, 0x44, 0x3F7FFFFF); }
 double DWM3000Class::convertToCM(int u) { return (double)u * PS_UNIT * SPEED_OF_LIGHT; }
-
 void DWM3000Class::setBit(int r, int s, int sh, bool b) { uint8_t t = read8bit(r, s); if (b) bitSet(t, sh); else bitClear(t, sh); write(r, s, t); }
-void DWM3000Class::setBitLow(int r, int s, int sh) { setBit(r, s, sh, 0); }
 void DWM3000Class::setBitHigh(int r, int s, int sh) { setBit(r, s, sh, 1); }
-
-void DWM3000Class::writeFastCommand(int cmd) {
-    int h = 0x1 | ((cmd & 0x1F) << 1) | 0x80;
-    int arr[] = {h}; sendBytes(arr, 1, 0);
-}
+void DWM3000Class::writeFastCommand(int cmd) { int h = 0x1 | ((cmd & 0x1F) << 1) | 0x80; int arr[] = {h}; sendBytes(arr, 1, 0); }
 
 uint32_t DWM3000Class::readOrWriteFullAddress(uint32_t base, uint32_t sub, uint32_t data, uint32_t dataLen, uint32_t rw) {
     uint32_t header = 0x00;
@@ -514,172 +562,40 @@ uint32_t DWM3000Class::sendBytes(int b[], int lenB, int recLen) {
 
 void DWM3000Class::clearAONConfig() { write(AON_REG, NO_OFFSET, 0x00, 2); write(AON_REG, 0x14, 0x00, 1); write(AON_REG, 0x04, 0x00, 1); write(AON_REG, 0x04, 0x02); delay(1); }
 unsigned int DWM3000Class::countBits(unsigned int n) { return (int)log2(n) + 1; }
-int DWM3000Class::checkForDevID() {
-    int res = read(GEN_CFG_AES_LOW_REG, NO_OFFSET);
-    if (res != 0xDECA0302 && res != 0xDECA0312) { Serial.println("[ERROR] DEV_ID wrong!"); return 0; }
-    return 1;
-}
+int DWM3000Class::checkForDevID() { int res = read(GEN_CFG_AES_LOW_REG, NO_OFFSET); if (res != 0xDECA0302 && res != 0xDECA0312) { Serial.println("[ERROR] DEV_ID wrong!"); return 0; } return 1; }
 
 // ==================== SETUP ====================
 
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.println("\n=== UWB Tag ===");
+    Serial.println("\n=== UWB Tag (TDMA) ===");
     Serial.print("Tag ID: "); Serial.println(TAG_ID);
-    Serial.print("Anchors: "); Serial.println(NUM_ANCHORS);
-    Serial.print("Listener: A"); Serial.println(LISTENER_ANCHOR_ID);
-
-    initializeAnchors();
+    my_slot = TAG_ID - FIRST_TAG_ID;
+    Serial.print("Slot: "); Serial.print(my_slot); Serial.print("/"); Serial.println(NUM_TAGS);
+    initAnchors();
     DWM3000.begin(); DWM3000.hardReset(); delay(200);
     if (!DWM3000.checkSPI()) { Serial.println("[FATAL] SPI failed"); while (1); }
-    while (!DWM3000.checkForIDLE()) { Serial.println("[ERROR] IDLE failed"); delay(1000); }
+    while (!DWM3000.checkForIDLE()) { Serial.println("[ERROR] IDLE"); delay(1000); }
     DWM3000.softReset(); delay(200);
-    if (!DWM3000.checkForIDLE()) { Serial.println("[FATAL] IDLE2 failed"); while (1); }
-
+    if (!DWM3000.checkForIDLE()) { Serial.println("[FATAL] IDLE2"); while (1); }
     DWM3000.init(); DWM3000.setupGPIO();
     DWM3000.setTXAntennaDelay(ANTENNA_DELAY);
     DWM3000.setSenderID(TAG_ID);
     DWM3000.configureAsTX();
     DWM3000.clearSystemStatus();
-
-    Serial.println("[OK] Tag ready, starting ranging\n");
+    Serial.println("[OK] Tag ready\n");
 }
 
 // ==================== MAIN LOOP ====================
 
 void loop() {
-    AnchorData *anchor = getCurrentAnchor();
-    int anchorId = getCurrentAnchorId();
-
-    switch (curr_stage) {
-
-    // ---- Send poll (stage 1) ----
-    case 0:
-        DWM3000.clearSystemStatus();
-        DWM3000.forceIdle();
-        delayMicroseconds(50);
-
-        range_attempts++;
-        anchor->t_roundA = 0;
-        anchor->t_replyA = 0;
-        DWM3000.setDestinationID(anchorId);
-        DWM3000.ds_sendFrame(STAGE_POLL);
-        anchor->tx = DWM3000.readTXTimestamp();
-        rx_wait_count = 0;
-        curr_stage = 1;
-        break;
-
-    // ---- Wait for response (stage 2) ----
-    case 1: {
-        int rx = DWM3000.receivedFrameSucc();
-        if (rx == 1) {
-            DWM3000.clearSystemStatus();
-            if (DWM3000.ds_isErrorFrame() || DWM3000.ds_getStage() != STAGE_RESP) {
-                range_errors++;
-                curr_stage = 0;
-            } else {
-                curr_stage = 2;
-            }
-        } else if (rx == 2) {
-            DWM3000.clearSystemStatus();
-            range_errors++;
-            curr_stage = 0;
-        } else {
-            rx_wait_count++;
-            if (rx_wait_count >= RX_TIMEOUT) {
-                range_timeouts++;
-                DWM3000.clearSystemStatus();
-                DWM3000.forceIdle();
-                curr_stage = 0;
-            }
-        }
-        break;
-    }
-
-    // ---- Send final (stage 3) ----
-    case 2:
-        anchor->rx = DWM3000.readRXTimestamp();
-        DWM3000.ds_sendFrame(STAGE_FINAL);
-        anchor->t_roundA = anchor->rx - anchor->tx;
-        anchor->tx = DWM3000.readTXTimestamp();
-        anchor->t_replyA = anchor->tx - anchor->rx;
-        rx_wait_count = 0;
-        curr_stage = 3;
-        break;
-
-    // ---- Wait for report (stage 4) ----
-    case 3: {
-        int rx = DWM3000.receivedFrameSucc();
-        if (rx == 1) {
-            DWM3000.clearSystemStatus();
-            if (DWM3000.ds_isErrorFrame()) {
-                range_errors++;
-                curr_stage = 0;
-            } else {
-                anchor->clock_offset = DWM3000.getRawClockOffset();
-                curr_stage = 4;
-            }
-        } else if (rx == 2) {
-            DWM3000.clearSystemStatus();
-            range_errors++;
-            curr_stage = 0;
-        } else {
-            rx_wait_count++;
-            if (rx_wait_count >= RX_TIMEOUT) {
-                range_timeouts++;
-                DWM3000.clearSystemStatus();
-                DWM3000.forceIdle();
-                curr_stage = 0;
-            }
-        }
-        break;
-    }
-
-    // ---- Compute distance, broadcast after last anchor ----
-    case 4: {
-        int tof = DWM3000.ds_processRTInfo(
-            anchor->t_roundA, anchor->t_replyA,
-            DWM3000.read(RX_BUFFER_0_REG, 0x04),
-            DWM3000.read(RX_BUFFER_0_REG, 0x08),
-            anchor->clock_offset);
-
-        anchor->distance = DWM3000.convertToCM(tof);
-        anchor->signal_strength = DWM3000.getSignalStrength();
-        anchor->fp_signal_strength = DWM3000.getFirstPathSignalStrength();
-        updateFilteredDistance(*anchor);
-        range_successes++;
-
-        // Print distance on tag serial (for debugging)
-        Serial.print("[DIST] A");
-        Serial.print(anchorId);
-        Serial.print(": ");
-        Serial.print(anchor->filtered_distance, 1);
-        Serial.println("cm");
-
-        // After ranging all anchors, broadcast distances to listener
-        if (current_anchor_index == NUM_ANCHORS - 1) {
-            broadcastDistances();
-        }
-
-        // Stats every 200 ranges
-        if (range_successes % 200 == 0) {
-            Serial.print("[STATS] ");
-            Serial.print(range_successes); Serial.print("/");
-            Serial.print(range_attempts); Serial.print(" ok, ");
-            Serial.print(range_timeouts); Serial.print(" timeout, ");
-            Serial.print(range_errors); Serial.print(" err, ");
-            Serial.print(bcast_successes); Serial.println(" bcast");
-        }
-
-        advanceToNextAnchor();
-        curr_stage = 0;
+    waitForSlot();
+    for (int a = 0; a < NUM_ANCHORS; a++) {
+        if (slotExpired()) break;
+        rangeWithAnchor(a);
         delay(INTER_RANGE_DELAY);
-        break;
     }
-
-    default:
-        curr_stage = 0;
-        break;
-    }
+    if (!slotExpired()) broadcastDistances();
+    else Serial.println("[BCAST] Slot expired");
 }

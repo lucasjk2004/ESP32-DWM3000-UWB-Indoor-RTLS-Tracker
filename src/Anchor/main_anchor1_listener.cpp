@@ -1,28 +1,27 @@
 // ============================================================
-//  UWB Spatial Tracking - ANCHOR / LISTENER Firmware
-//  Architecture: Responds to tag-initiated DS-TWR.
-//  If this is the LISTENER anchor, it also receives distance
-//  broadcasts from the tag and outputs CSV over serial.
+//  UWB Spatial Tracking - LISTENER ANCHOR (Anchor 1)
+//  Plugged into computer via USB. Two jobs:
+//    1. Responds to DS-TWR polls from tags (like any anchor)
+//    2. Receives broadcast frames and outputs CSV over serial
 //
-//  To deploy multiple anchors: flash this same code to each
-//  ESP32+DWM3000, just change ANCHOR_ID (1, 2, 3, ...).
-//  One anchor should have IS_LISTENER = true (typically anchor 1).
+//  CSV format: tag_id,dist0,dist1,dist2,dist3,rssi0,rssi1,rssi2,rssi3
+//  Lines starting with # are comments (ignored by parser)
+//
+//  Your Python/JSX visualization script reads this serial stream.
 // ============================================================
 
 #include <Arduino.h>
 #include <SPI.h>
 
 // ==================== CONFIGURATION ====================
-// Change ANCHOR_ID for each anchor board (1, 2, 3, ...)
 
+#ifndef ANCHOR_ID
 #define ANCHOR_ID           1
-#define IS_LISTENER         true    // Set true on ONE anchor (the one connected to computer)
+#endif
 
-// Must match tag firmware
-#define NUM_ANCHORS         4       // Total anchors in system (for parsing broadcast)
-#define FIRST_ANCHOR_ID     1
+#define NUM_ANCHORS         4
+#define NUM_TAGS            3
 
-// Hardware pins
 #define RST_PIN             27
 #define CHIP_SELECT_PIN     4
 
@@ -48,11 +47,8 @@
 #define CLOCK_OFFSET_CHAN_9_CONSTANT -0.1252e-3f
 #define PS_UNIT 15.6500400641025641
 #define SPEED_OF_LIGHT 0.029979245800
-#define TRANSMIT_DELAY 0x3B9ACA00
-#define TRANSMIT_DIFF 0x1FF
 #define NO_OFFSET 0x0
 
-// Register addresses
 #define GEN_CFG_AES_LOW_REG 0x00
 #define GEN_CFG_AES_HIGH_REG 0x01
 #define STS_CFG_REG 0x2
@@ -64,12 +60,10 @@
 #define AON_REG 0xA
 #define OTP_IF_REG 0xB
 #define CIA_REG1 0xC
-#define DIG_DIAG_REG 0xF
 #define PMSC_REG 0x11
 #define RX_BUFFER_0_REG 0x12
 #define TX_BUFFER_REG 0x14
 
-// Frame stages (must match tag)
 #define STAGE_POLL     1
 #define STAGE_RESP     2
 #define STAGE_FINAL    3
@@ -88,14 +82,13 @@ int config[] = {
     DATARATE_6_8MB, PHR_MODE_STANDARD, PHR_RATE_850KB
 };
 
-// Ranging state
 static int curr_stage = 0;
+static int ranging_tag_id = -1;
 static int t_roundB = 0;
 static int t_replyB = 0;
 static long long anchor_rx = 0;
 static long long anchor_tx = 0;
 
-// Stats
 static unsigned long ranges_completed = 0;
 static unsigned long broadcasts_received = 0;
 static unsigned long rx_errors = 0;
@@ -104,102 +97,70 @@ static unsigned long rx_errors = 0;
 
 class DWM3000Class {
 public:
-    static void begin();
-    static void init();
-    static void writeSysConfig();
-    static void configureAsTX();
-    static void setupGPIO();
+    static void begin(); static void init(); static void writeSysConfig();
+    static void configureAsTX(); static void setupGPIO();
     static void ds_sendFrame(int stage);
-    static void ds_sendRTInfo(int t_roundB, int t_replyB);
-    static int  ds_getStage();
-    static bool ds_isErrorFrame();
-    static void ds_sendErrorFrame();
-    static void setMode(int mode);
-    static void setFrameLength(int frame_len);
-    static void setTXAntennaDelay(int delay);
-    static void setSenderID(int senderID);
-    static void setDestinationID(int destID);
-    static int  receivedFrameSucc();
-    static int  sentFrameSucc();
-    static int  getSenderID();
-    static int  getDestinationID();
-    static bool checkForIDLE();
-    static bool checkSPI();
-    static int  getTXAntennaDelay();
-    static long double getClockOffset();
-    static long double getClockOffset(int32_t ext);
-    static int  getRawClockOffset();
-    static unsigned long long readRXTimestamp();
-    static unsigned long long readTXTimestamp();
-    static uint32_t write(int base, int sub, uint32_t data, int data_len);
+    static void ds_sendRTInfo(int trB, int trpB);
+    static int  ds_getStage(); static bool ds_isErrorFrame();
+    static void setMode(int mode); static void setFrameLength(int len);
+    static void setTXAntennaDelay(int d);
+    static void setSenderID(int s); static void setDestinationID(int d);
+    static int  receivedFrameSucc(); static int sentFrameSucc();
+    static int  getSenderID(); static int getDestinationID();
+    static bool checkForIDLE(); static bool checkSPI();
+    static unsigned long long readRXTimestamp(); static unsigned long long readTXTimestamp();
+    static uint32_t write(int base, int sub, uint32_t data, int len);
     static uint32_t write(int base, int sub, uint32_t data);
     static uint32_t read(int base, int sub);
     static uint8_t  read8bit(int base, int sub);
     static uint32_t readOTP(uint8_t addr);
-    static void forceIdle();
-    static void standardTX();
-    static void standardRX();
-    static void TXInstantRX();
-    static void softReset();
-    static void hardReset();
+    static void forceIdle(); static void standardTX();
+    static void standardRX(); static void TXInstantRX();
+    static void softReset(); static void hardReset();
     static void clearSystemStatus();
-    static double convertToCM(int ps_units);
 private:
     static void spiSelect(uint8_t cs);
     static void setBit(int r, int s, int sh, bool b);
-    static void setBitLow(int r, int s, int sh);
     static void setBitHigh(int r, int s, int sh);
     static void writeFastCommand(int cmd);
-    static uint32_t readOrWriteFullAddress(uint32_t base, uint32_t sub, uint32_t data, uint32_t data_len, uint32_t rw);
+    static uint32_t readOrWriteFullAddress(uint32_t base, uint32_t sub, uint32_t data, uint32_t len, uint32_t rw);
     static uint32_t sendBytes(int b[], int lenB, int recLen);
     static void clearAONConfig();
-    static unsigned int countBits(unsigned int number);
+    static unsigned int countBits(unsigned int n);
     static int checkForDevID();
 };
 
 DWM3000Class DWM3000;
 
 // ==================== BROADCAST HANDLER ====================
-// Called when the listener receives a distance broadcast from the tag.
-// Parses the packed data and outputs CSV to serial.
-//
-// CSV format (matches guide style):
-//   x,y,x_filtered,y_filtered,dist0,dist1,...,dist7
-//
-// Since we only have distances (trilateration happens on the computer),
-// we output 0 for x/y and provide distances in meters.
-// The computer (Processing IDE or Python) does the trilateration.
 
 void handleDataBroadcast() {
     int tag_id = DWM3000.read(RX_BUFFER_0_REG, 0x01) & 0xFF;
     broadcasts_received++;
 
-    // Output CSV: 0,0,0,0, then distances for each anchor in meters
-    // Pad to 8 slots (unused = 0) for compatibility with guide's Processing code
-    Serial.print("0,0,0,0");
-
-    for (int i = 0; i < 8; i++) {
-        Serial.print(",");
-        if (i < NUM_ANCHORS) {
-            uint32_t raw = DWM3000.read(RX_BUFFER_0_REG, 0x04 + (i * 2));
-            uint16_t dist_cm = raw & 0xFFFF;
-            float dist_m = dist_cm / 100.0;
-            Serial.print(dist_m, 3);
-        } else {
-            Serial.print("0.000");
-        }
+    float distances[NUM_ANCHORS];
+    for (int i = 0; i < NUM_ANCHORS; i++) {
+        uint32_t raw = DWM3000.read(RX_BUFFER_0_REG, 0x04 + (i * 2));
+        distances[i] = (raw & 0xFFFF) / 100.0;
     }
+
+    float rssi[NUM_ANCHORS];
+    for (int i = 0; i < NUM_ANCHORS; i++) {
+        uint32_t raw = DWM3000.read(RX_BUFFER_0_REG, 0x04 + (NUM_ANCHORS * 2) + (i * 2));
+        rssi[i] = (int16_t)(raw & 0xFFFF) / 100.0;
+    }
+
+    // CSV output: tag_id,d0,d1,d2,d3,rssi0,rssi1,rssi2,rssi3
+    Serial.print(tag_id);
+    for (int i = 0; i < NUM_ANCHORS; i++) { Serial.print(","); Serial.print(distances[i], 3); }
+    for (int i = 0; i < NUM_ANCHORS; i++) { Serial.print(","); Serial.print(rssi[i], 1); }
     Serial.println();
 }
 
 // ==================== DWM3000 IMPLEMENTATIONS ====================
 
 void DWM3000Class::spiSelect(uint8_t cs) { pinMode(cs, OUTPUT); digitalWrite(cs, HIGH); delay(5); }
-
-void DWM3000Class::begin() {
-    delay(5); pinMode(CHIP_SELECT_PIN, OUTPUT); SPI.begin(); delay(5);
-    spiSelect(CHIP_SELECT_PIN);
-}
+void DWM3000Class::begin() { delay(5); pinMode(CHIP_SELECT_PIN, OUTPUT); SPI.begin(); delay(5); spiSelect(CHIP_SELECT_PIN); }
 
 void DWM3000Class::init() {
     if (!checkForDevID()) { Serial.println("[ERROR] Dev ID wrong!"); return; }
@@ -213,7 +174,8 @@ void DWM3000Class::init() {
     int xtrim = readOTP(0x1E); xtrim = xtrim == 0 ? 0x2E : xtrim;
     write(FS_CTRL_REG, 0x14, xtrim);
     writeSysConfig();
-    write(0x00, 0x3C, 0xFFFFFFFF); write(0x00, 0x40, 0xFFFF); write(0x0A, 0x00, 0x000900, 3);
+    write(0x00, 0x3C, 0xFFFFFFFF); write(0x00, 0x40, 0xFFFF);
+    write(0x0A, 0x00, 0x000900, 3);
     write(0x3, 0x1C, 0x10000240); write(0x3, 0x20, 0x1B6DA489);
     write(0x3, 0x38, 0x0001C0FD); write(0x3, 0x3C, 0x0001C43E);
     write(0x3, 0x40, 0x0001C6BE); write(0x3, 0x44, 0x0001C77E);
@@ -280,13 +242,12 @@ void DWM3000Class::ds_sendFrame(int stage) {
     setFrameLength(4);
     TXInstantRX();
     for (int i = 0; i < 50; i++) { if (sentFrameSucc()) return; }
-    Serial.println("[ERROR] TX failed");
 }
 
 void DWM3000Class::ds_sendRTInfo(int trB, int trpB) {
     setMode(1);
-    write(TX_BUFFER_REG, 0x01, destination & 0xFF);
-    write(TX_BUFFER_REG, 0x02, sender_id & 0xFF);
+    write(TX_BUFFER_REG, 0x01, sender_id & 0xFF);
+    write(TX_BUFFER_REG, 0x02, destination & 0xFF);
     write(TX_BUFFER_REG, 0x03, STAGE_REPORT);
     write(TX_BUFFER_REG, 0x04, trB);
     write(TX_BUFFER_REG, 0x08, trpB);
@@ -296,42 +257,17 @@ void DWM3000Class::ds_sendRTInfo(int trB, int trpB) {
 
 int  DWM3000Class::ds_getStage()     { return read(RX_BUFFER_0_REG, 0x03) & 0b111; }
 bool DWM3000Class::ds_isErrorFrame() { return ((read(RX_BUFFER_0_REG, 0x00) & 0x7) == 7); }
-void DWM3000Class::ds_sendErrorFrame() { setMode(7); setFrameLength(3); standardTX(); }
-
 void DWM3000Class::setMode(int mode) { write(TX_BUFFER_REG, 0x00, mode & 0x7); }
-void DWM3000Class::setFrameLength(int len) {
-    len += FCS_LEN;
-    int cfg = read(0x00, 0x24);
-    write(GEN_CFG_AES_LOW_REG, 0x24, (cfg & 0xFFFFFC00) | len);
-}
+void DWM3000Class::setFrameLength(int len) { len += FCS_LEN; int cfg = read(0x00, 0x24); write(GEN_CFG_AES_LOW_REG, 0x24, (cfg & 0xFFFFFC00) | len); }
 void DWM3000Class::setTXAntennaDelay(int d) { ANTENNA_DELAY = d; write(0x01, 0x04, d); }
-void DWM3000Class::setSenderID(int s)       { sender_id = s; }
-void DWM3000Class::setDestinationID(int d)  { destination = d; }
-
-int DWM3000Class::receivedFrameSucc() {
-    int s = read(GEN_CFG_AES_LOW_REG, 0x44);
-    if (s & SYS_STATUS_FRAME_RX_SUCC) return 1;
-    if (s & SYS_STATUS_RX_ERR) return 2;
-    return 0;
-}
-
-int  DWM3000Class::sentFrameSucc()   { return (read(GEN_CFG_AES_LOW_REG, 0x44) & SYS_STATUS_FRAME_TX_SUCC) ? 1 : 0; }
-int  DWM3000Class::getSenderID()     { return read(RX_BUFFER_0_REG, 0x01) & 0xFF; }
-int  DWM3000Class::getDestinationID(){ return read(RX_BUFFER_0_REG, 0x02) & 0xFF; }
-bool DWM3000Class::checkForIDLE() {
-    return ((read(0x0F, 0x30) >> 16) & PMSC_STATE_IDLE) == PMSC_STATE_IDLE ||
-           ((read(0x00, 0x44) >> 16) & (SPIRDY_MASK | RCINIT_MASK)) == (SPIRDY_MASK | RCINIT_MASK);
-}
+void DWM3000Class::setSenderID(int s) { sender_id = s; }
+void DWM3000Class::setDestinationID(int d) { destination = d; }
+int DWM3000Class::receivedFrameSucc() { int s = read(GEN_CFG_AES_LOW_REG, 0x44); if (s & SYS_STATUS_FRAME_RX_SUCC) return 1; if (s & SYS_STATUS_RX_ERR) return 2; return 0; }
+int  DWM3000Class::sentFrameSucc()    { return (read(GEN_CFG_AES_LOW_REG, 0x44) & SYS_STATUS_FRAME_TX_SUCC) ? 1 : 0; }
+int  DWM3000Class::getSenderID()      { return read(RX_BUFFER_0_REG, 0x01) & 0xFF; }
+int  DWM3000Class::getDestinationID() { return read(RX_BUFFER_0_REG, 0x02) & 0xFF; }
+bool DWM3000Class::checkForIDLE() { return ((read(0x0F, 0x30) >> 16) & PMSC_STATE_IDLE) == PMSC_STATE_IDLE || ((read(0x00, 0x44) >> 16) & (SPIRDY_MASK | RCINIT_MASK)) == (SPIRDY_MASK | RCINIT_MASK); }
 bool DWM3000Class::checkSPI() { return checkForDevID(); }
-int  DWM3000Class::getTXAntennaDelay() { return read(0x01, 0x04) & 0xFFFF; }
-long double DWM3000Class::getClockOffset() { return getRawClockOffset() * (config[0] == CHANNEL_5 ? CLOCK_OFFSET_CHAN_5_CONSTANT : CLOCK_OFFSET_CHAN_9_CONSTANT) / 1000000; }
-long double DWM3000Class::getClockOffset(int32_t o) { return o * (config[0] == CHANNEL_5 ? CLOCK_OFFSET_CHAN_5_CONSTANT : CLOCK_OFFSET_CHAN_9_CONSTANT) / 1000000; }
-int DWM3000Class::getRawClockOffset() {
-    int raw = read(DRX_REG, 0x29) & 0x1FFFFF;
-    if (raw & (1 << 20)) raw |= ~((1 << 21) - 1);
-    return raw;
-}
-
 unsigned long long DWM3000Class::readRXTimestamp() { uint32_t lo = read(CIA_REG1, 0x00); unsigned long long hi = read(CIA_REG1, 0x04) & 0xFF; return (hi << 32) | lo; }
 unsigned long long DWM3000Class::readTXTimestamp() { unsigned long long lo = read(0x00, 0x74); unsigned long long hi = read(0x00, 0x78) & 0xFF; return (hi << 32) + lo; }
 uint32_t DWM3000Class::write(int base, int sub, uint32_t data, int len) { return readOrWriteFullAddress(base, sub, data, len, 1); }
@@ -339,7 +275,6 @@ uint32_t DWM3000Class::write(int base, int sub, uint32_t data) { return readOrWr
 uint32_t DWM3000Class::read(int base, int sub) { return readOrWriteFullAddress(base, sub, 0, 0, 0); }
 uint8_t  DWM3000Class::read8bit(int base, int sub) { return (uint8_t)(read(base, sub) >> 24); }
 uint32_t DWM3000Class::readOTP(uint8_t addr) { write(OTP_IF_REG, 0x04, addr); write(OTP_IF_REG, 0x08, 0x02); return read(OTP_IF_REG, 0x10); }
-
 void DWM3000Class::forceIdle()        { writeFastCommand(0x00); }
 void DWM3000Class::standardTX()       { writeFastCommand(0x01); }
 void DWM3000Class::standardRX()       { writeFastCommand(0x02); }
@@ -347,15 +282,9 @@ void DWM3000Class::TXInstantRX()      { writeFastCommand(0x0C); }
 void DWM3000Class::softReset()        { clearAONConfig(); write(PMSC_REG, 0x04, 0x1); write(PMSC_REG, 0x00, 0x00, 2); delay(100); write(PMSC_REG, 0x00, 0xFFFF); write(PMSC_REG, 0x04, 0x00, 1); }
 void DWM3000Class::hardReset()        { pinMode(RST_PIN, OUTPUT); digitalWrite(RST_PIN, LOW); delay(10); pinMode(RST_PIN, INPUT); }
 void DWM3000Class::clearSystemStatus(){ write(GEN_CFG_AES_LOW_REG, 0x44, 0x3F7FFFFF); }
-double DWM3000Class::convertToCM(int u) { return (double)u * PS_UNIT * SPEED_OF_LIGHT; }
-
 void DWM3000Class::setBit(int r, int s, int sh, bool b) { uint8_t t = read8bit(r, s); if (b) bitSet(t, sh); else bitClear(t, sh); write(r, s, t); }
-void DWM3000Class::setBitLow(int r, int s, int sh) { setBit(r, s, sh, 0); }
 void DWM3000Class::setBitHigh(int r, int s, int sh) { setBit(r, s, sh, 1); }
-void DWM3000Class::writeFastCommand(int cmd) {
-    int h = 0x1 | ((cmd & 0x1F) << 1) | 0x80;
-    int arr[] = {h}; sendBytes(arr, 1, 0);
-}
+void DWM3000Class::writeFastCommand(int cmd) { int h = 0x1 | ((cmd & 0x1F) << 1) | 0x80; int arr[] = {h}; sendBytes(arr, 1, 0); }
 
 uint32_t DWM3000Class::readOrWriteFullAddress(uint32_t base, uint32_t sub, uint32_t data, uint32_t dataLen, uint32_t rw) {
     uint32_t header = 0x00;
@@ -388,90 +317,89 @@ uint32_t DWM3000Class::sendBytes(int b[], int lenB, int recLen) {
 
 void DWM3000Class::clearAONConfig() { write(AON_REG, NO_OFFSET, 0x00, 2); write(AON_REG, 0x14, 0x00, 1); write(AON_REG, 0x04, 0x00, 1); write(AON_REG, 0x04, 0x02); delay(1); }
 unsigned int DWM3000Class::countBits(unsigned int n) { return (int)log2(n) + 1; }
-int DWM3000Class::checkForDevID() {
-    int res = read(GEN_CFG_AES_LOW_REG, NO_OFFSET);
-    if (res != 0xDECA0302 && res != 0xDECA0312) { Serial.println("[ERROR] DEV_ID wrong!"); return 0; }
-    return 1;
-}
+int DWM3000Class::checkForDevID() { int res = read(GEN_CFG_AES_LOW_REG, NO_OFFSET); if (res != 0xDECA0302 && res != 0xDECA0312) { Serial.println("[ERROR] DEV_ID wrong!"); return 0; } return 1; }
 
 // ==================== SETUP ====================
 
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.println("\n=== UWB Anchor ===");
-    Serial.print("Anchor ID: "); Serial.println(ANCHOR_ID);
-    Serial.print("Listener: "); Serial.println(IS_LISTENER ? "YES" : "NO");
+    Serial.println("# UWB Listener Anchor");
+    Serial.print("# Anchor ID: "); Serial.println(ANCHOR_ID);
 
     DWM3000.begin(); DWM3000.hardReset(); delay(200);
-    if (!DWM3000.checkSPI()) { Serial.println("[FATAL] SPI failed"); while (1); }
-    while (!DWM3000.checkForIDLE()) { Serial.println("[ERROR] IDLE failed"); delay(1000); }
+    if (!DWM3000.checkSPI()) { Serial.println("# [FATAL] SPI failed"); while (1); }
+    while (!DWM3000.checkForIDLE()) { Serial.println("# [ERROR] IDLE"); delay(1000); }
     DWM3000.softReset(); delay(200);
-    if (!DWM3000.checkForIDLE()) { Serial.println("[FATAL] IDLE2 failed"); while (1); }
+    if (!DWM3000.checkForIDLE()) { Serial.println("# [FATAL] IDLE2"); while (1); }
 
     DWM3000.init(); DWM3000.setupGPIO();
     DWM3000.setTXAntennaDelay(ANTENNA_DELAY);
     DWM3000.setSenderID(ANCHOR_ID);
     DWM3000.configureAsTX();
     DWM3000.clearSystemStatus();
-    DWM3000.standardRX();  // Start listening
+    DWM3000.standardRX();
 
-    // Print CSV header for computer parsing (listener only)
-    if (IS_LISTENER) {
-        Serial.println("x,y,x_filtered,y_filtered,dist0,dist1,dist2,dist3,dist4,dist5,dist6,dist7");
-    }
-
-    Serial.println("[OK] Anchor ready, listening\n");
+    Serial.print("# CSV: tag_id");
+    for (int i = 0; i < NUM_ANCHORS; i++) { Serial.print(",dist"); Serial.print(i); }
+    for (int i = 0; i < NUM_ANCHORS; i++) { Serial.print(",rssi"); Serial.print(i); }
+    Serial.println();
+    Serial.println("# Ready");
 }
 
 // ==================== MAIN LOOP ====================
 
 void loop() {
-    // Read RX status ONCE per loop (fixes double-read bug)
     int rx_result = DWM3000.receivedFrameSucc();
 
     if (rx_result == 1) {
         int stage = DWM3000.ds_getStage();
         int dest  = DWM3000.getDestinationID();
+        int from  = DWM3000.getSenderID();
 
-        // === Distance broadcast from tag (stage 5) ===
-        if (stage == STAGE_BCAST && dest == ANCHOR_ID && IS_LISTENER) {
+        // Broadcast from tag
+        if (stage == STAGE_BCAST && dest == ANCHOR_ID) {
             DWM3000.clearSystemStatus();
             handleDataBroadcast();
             DWM3000.standardRX();
             curr_stage = 0;
+            ranging_tag_id = -1;
             return;
         }
 
-        // === DS-TWR Stage 1: Poll from tag ===
+        // DS-TWR Poll
         if (stage == STAGE_POLL && dest == ANCHOR_ID) {
             DWM3000.clearSystemStatus();
             curr_stage = 0;
-            t_roundB = 0;
-            t_replyB = 0;
-
+            ranging_tag_id = from;
+            t_roundB = 0; t_replyB = 0;
+            DWM3000.setDestinationID(from);
             anchor_rx = DWM3000.readRXTimestamp();
             DWM3000.ds_sendFrame(STAGE_RESP);
             anchor_tx = DWM3000.readTXTimestamp();
             t_replyB = anchor_tx - anchor_rx;
             curr_stage = 2;
-            // TXInstantRX already put us back in RX
             return;
         }
 
-        // === DS-TWR Stage 3: Final from tag ===
+        // DS-TWR Final
         if (stage == STAGE_FINAL && dest == ANCHOR_ID && curr_stage == 2) {
+            if (from != ranging_tag_id) {
+                DWM3000.clearSystemStatus();
+                DWM3000.standardRX();
+                curr_stage = 0; ranging_tag_id = -1;
+                return;
+            }
             DWM3000.clearSystemStatus();
             anchor_rx = DWM3000.readRXTimestamp();
             t_roundB = anchor_rx - anchor_tx;
             DWM3000.ds_sendRTInfo(t_roundB, t_replyB);
             ranges_completed++;
-            curr_stage = 0;
-            // TXInstantRX already put us back in RX
+            curr_stage = 0; ranging_tag_id = -1;
             return;
         }
 
-        // Unrelated frame, ignore
+        // Unrelated frame (e.g. polls to other anchors)
         DWM3000.clearSystemStatus();
         DWM3000.standardRX();
 
