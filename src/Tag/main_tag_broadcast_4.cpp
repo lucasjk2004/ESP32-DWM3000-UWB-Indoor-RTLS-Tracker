@@ -16,14 +16,14 @@
 // ==================== CONFIGURATION ====================
 
 #ifndef TAG_ID
-#define TAG_ID              7
+#define TAG_ID              10
 #endif
 
 #define NUM_ANCHORS         6
 #define FIRST_ANCHOR_ID     1
 #define LISTENER_ANCHOR_ID  1
-#define NUM_TAGS            3
-#define FIRST_TAG_ID        8
+#define NUM_TAGS            4
+#define FIRST_TAG_ID        7
 
 #define RST_PIN             27
 #define CHIP_SELECT_PIN     4
