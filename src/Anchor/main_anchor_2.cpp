@@ -259,6 +259,8 @@ void loop() {
             DWM3000.ds_sendRTInfo(t_roundB, t_replyB);
             ranges_completed++;
             curr_stage = 0; ranging_tag_id = -1;
+            DWM3000.clearSystemStatus();
+            DWM3000.standardRX();
             return;
         }
 

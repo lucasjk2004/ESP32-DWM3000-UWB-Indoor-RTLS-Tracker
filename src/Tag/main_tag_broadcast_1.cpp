@@ -509,7 +509,7 @@ int  DWM3000Class::getSenderID()      { return read(RX_BUFFER_0_REG, 0x01) & 0xF
 int  DWM3000Class::getDestinationID() { return read(RX_BUFFER_0_REG, 0x02) & 0xFF; }
 bool DWM3000Class::checkForIDLE() { return ((read(0x0F, 0x30) >> 16) & PMSC_STATE_IDLE) == PMSC_STATE_IDLE || ((read(0x00, 0x44) >> 16) & (SPIRDY_MASK | RCINIT_MASK)) == (SPIRDY_MASK | RCINIT_MASK); }
 bool DWM3000Class::checkSPI() { return checkForDevID(); }
-double DWM3000Class::getSignalStrength() { int cir = read(CIA_REG1, 0x2C) & 0x1FF; int pac = read(CIA_REG1, 0x58) & 0xFFF; unsigned int dgc = (read(RX_TUNE_REG, 0x60) >> 28) & 0x7; return 10 * log10((cir * (1 << 21)) / pow(pac, 2)) + (6 * dgc) - 121.7; }
+double DWM3000Class::getSignalStrength() { int cir = read(CIA_REG1, 0x2C) & 0x1FF; int pac = read(CIA_REG1, 0x58) & 0xFFF; if (pac == 0) return 0.0; unsigned int dgc = (read(RX_TUNE_REG, 0x60) >> 28) & 0x7; return 10 * log10((cir * (1 << 21)) / pow(pac, 2)) + (6 * dgc) - 121.7; }
 int DWM3000Class::getRawClockOffset() { int raw = read(DRX_REG, 0x29) & 0x1FFFFF; if (raw & (1 << 20)) raw |= ~((1 << 21) - 1); return raw; }
 long double DWM3000Class::getClockOffset(int32_t o) { return o * (config[0] == CHANNEL_5 ? CLOCK_OFFSET_CHAN_5_CONSTANT : CLOCK_OFFSET_CHAN_9_CONSTANT) / 1000000; }
 unsigned long long DWM3000Class::readRXTimestamp() { uint32_t lo = read(CIA_REG1, 0x00); unsigned long long hi = read(CIA_REG1, 0x04) & 0xFF; return (hi << 32) | lo; }
