@@ -4,10 +4,14 @@
 //    1. Responds to DS-TWR polls from tags (like any anchor)
 //    2. Receives broadcast frames and outputs CSV over serial
 //
-//  CSV format: tag_id,dist0,dist1,dist2,dist3,rssi0,rssi1,rssi2,rssi3
+//  CSV format: tag_id,dist0,dist1,...,dist5,rssi0,rssi1,...,rssi5
 //  Lines starting with # are comments (ignored by parser)
 //
-//  Your Python/JSX visualization script reads this serial stream.
+//  CHANGES from original:
+//    - Distance unpacking: divide by 1000.0 instead of 100.0
+//      Tags now pack as uint16 * 10 (1mm resolution in cm units).
+//      Raw value / 1000.0 = meters directly.
+//      Example: 350cm -> packed as 3500 -> 3500/1000.0 = 3.500m
 // ============================================================
 
 #include <Arduino.h>
@@ -141,7 +145,9 @@ void handleDataBroadcast() {
     float distances[NUM_ANCHORS];
     for (int i = 0; i < NUM_ANCHORS; i++) {
         uint32_t raw = DWM3000.read(RX_BUFFER_0_REG, 0x04 + (i * 2));
-        distances[i] = (raw & 0xFFFF) / 100.0;
+        // Tags pack as uint16 * 10 (1mm resolution in cm).
+        // Divide by 1000.0 to get meters directly.
+        distances[i] = (raw & 0xFFFF) / 1000.0;
     }
 
     float rssi[NUM_ANCHORS];
@@ -150,9 +156,9 @@ void handleDataBroadcast() {
         rssi[i] = (int16_t)(raw & 0xFFFF) / 100.0;
     }
 
-    // CSV output: tag_id,d0,d1,d2,d3,rssi0,rssi1,rssi2,rssi3
+    // CSV output: tag_id,d0,d1,...,d5,rssi0,rssi1,...,rssi5
     Serial.print(tag_id);
-    for (int i = 0; i < NUM_ANCHORS; i++) { Serial.print(","); Serial.print(distances[i], 3); }
+    for (int i = 0; i < NUM_ANCHORS; i++) { Serial.print(","); Serial.print(distances[i], 4); }
     for (int i = 0; i < NUM_ANCHORS; i++) { Serial.print(","); Serial.print(rssi[i], 1); }
     Serial.println();
 }
@@ -326,6 +332,7 @@ void setup() {
     delay(500);
     Serial.println("# UWB Listener Anchor");
     Serial.print("# Anchor ID: "); Serial.println(ANCHOR_ID);
+    Serial.println("# Distance encoding: uint16 * 10 (1mm units) -> divide by 1000 for meters");
 
     DWM3000.begin(); DWM3000.hardReset(); delay(200);
     if (!DWM3000.checkSPI()) { Serial.println("# [FATAL] SPI failed"); while (1); }
@@ -399,7 +406,7 @@ void loop() {
             return;
         }
 
-        // Unrelated frame (e.g. polls to other anchors)
+        // Unrelated frame
         DWM3000.clearSystemStatus();
         DWM3000.standardRX();
 

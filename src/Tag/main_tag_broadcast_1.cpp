@@ -8,6 +8,14 @@
 //
 //  FLASH: Same file for all tags. Set TAG_ID via build_flags.
 //  SYSTEM CONFIG must match across all devices.
+//
+//  CHANGES from original:
+//    - RX_TIMEOUT_MS: 10 -> 6       (saves ~24ms per slot cycle)
+//    - INTER_RANGE_DELAY: 2 -> 1    (saves ~5ms per slot cycle)
+//    - SLOT_DURATION_MS: 100 -> 85  (tight but safe with 6 anchors @ ~12ms each)
+//    - MAX_RANGE_RETRIES: 1 -> 0    (retries burn slot time; skip and broadcast)
+//    - FILTER_SIZE: 5 -> 3          (less lag, still smooths outliers)
+//    - Broadcast packs distances as uint16 * 10 (1mm resolution, was 1cm)
 // ============================================================
 
 #include <Arduino.h>
@@ -28,12 +36,12 @@
 #define RST_PIN             27
 #define CHIP_SELECT_PIN     4
 
-#define RX_TIMEOUT_MS       10
-#define INTER_RANGE_DELAY   2
-#define SLOT_DURATION_MS    100
-#define MAX_RANGE_RETRIES   1
+#define RX_TIMEOUT_MS       6    // was 10 — DWM3000 response is fast, 6ms is reliable
+#define INTER_RANGE_DELAY   1    // was 2
+#define SLOT_DURATION_MS    85   // was 100 — 6 anchors × ~12ms = ~72ms + margin
+#define MAX_RANGE_RETRIES   0    // was 1 — retries kill your slot; skip and broadcast
 
-#define FILTER_SIZE         5
+#define FILTER_SIZE         3    // was 5 — less lag, still smooths outliers
 #define MIN_DISTANCE        0.0
 #define MAX_DISTANCE        2000.0
 
@@ -234,6 +242,10 @@ void broadcastDistances();
 // bad RX state that prevented TXInstantRX from working. standardTX()
 // just transmits and stops, which is what we want for a broadcast.
 // The listener is already in RX mode waiting.
+//
+// PRECISION CHANGE: distances are packed as uint16 * 10 (1mm resolution).
+// Max representable distance = 6553.5cm = 65.5m (plenty for indoor UWB).
+// Listener must divide raw value by 1000.0 to get meters.
 
 void broadcastDistances() {
     // Full reset to clean state
@@ -249,7 +261,8 @@ void broadcastDistances() {
     DWM3000.write(TX_BUFFER_REG, 0x03, STAGE_BCAST & 0x7);
 
     for (int i = 0; i < NUM_ANCHORS; i++) {
-        uint16_t d = (uint16_t)(anchors[i].filtered_distance);
+        // Pack as 1mm units (x10 from cm): max 6553.5cm representable
+        uint16_t d = (uint16_t)(anchors[i].filtered_distance * 10);
         DWM3000.write(TX_BUFFER_REG, 0x04 + (i * 2), d, 2);
     }
 
@@ -573,6 +586,8 @@ void setup() {
     Serial.print("Tag ID: "); Serial.println(TAG_ID);
     my_slot = TAG_ID - FIRST_TAG_ID;
     Serial.print("Slot: "); Serial.print(my_slot); Serial.print("/"); Serial.println(NUM_TAGS);
+    Serial.print("Slot duration: "); Serial.print(SLOT_DURATION_MS); Serial.println("ms");
+    Serial.print("RX timeout: "); Serial.print(RX_TIMEOUT_MS); Serial.println("ms");
     initAnchors();
     DWM3000.begin(); DWM3000.hardReset(); delay(200);
     if (!DWM3000.checkSPI()) { Serial.println("[FATAL] SPI failed"); while (1); }
