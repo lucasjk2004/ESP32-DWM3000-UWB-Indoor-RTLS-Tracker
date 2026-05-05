@@ -28,12 +28,12 @@
 #define RST_PIN             27
 #define CHIP_SELECT_PIN     4
 
-#define RX_TIMEOUT_MS       10
-#define INTER_RANGE_DELAY   2
-#define SLOT_DURATION_MS    100
-#define MAX_RANGE_RETRIES   1
+#define RX_TIMEOUT_MS       8
+#define INTER_RANGE_DELAY   1
+#define SLOT_DURATION_MS    60
+#define MAX_RANGE_RETRIES   0
 
-#define FILTER_SIZE         5
+#define FILTER_SIZE         3
 #define MIN_DISTANCE        0.0
 #define MAX_DISTANCE        2000.0
 
@@ -81,6 +81,9 @@
 #define STAGE_FINAL    3
 #define STAGE_REPORT   4
 #define STAGE_BCAST    5
+#define STAGE_SYNC     6
+
+#define SYNC_TIMEOUT_MS  5000
 
 // ==================== GLOBALS ====================
 
@@ -96,6 +99,9 @@ int config[] = {
 
 static int my_slot = 0;
 static unsigned long slot_start_ms = 0;
+static unsigned long cycle_epoch_ms = 0;
+static bool synced = false;
+static unsigned long cycle_count = 0;
 
 static unsigned long stat_attempts = 0;
 static unsigned long stat_ok = 0;
@@ -116,6 +122,7 @@ struct AnchorData {
     float distance_history[FILTER_SIZE] = {0};
     int history_index = 0;
     float filtered_distance = 0;
+    float ema_distance = -1;        // exponential moving average; -1 = uninitialized
     float signal_strength = 0;
 };
 
@@ -137,6 +144,10 @@ float calcMedian(float arr[], int size) {
     return (size % 2 == 0) ? (tmp[size/2 - 1] + tmp[size/2]) / 2.0 : tmp[size/2];
 }
 
+// EMA alpha: higher = more responsive, lower = smoother
+// 0.35 gives good balance at ~6-8 Hz update rate
+#define EMA_ALPHA 0.35f
+
 void updateFilter(AnchorData &a) {
     a.distance_history[a.history_index] = a.distance;
     a.history_index = (a.history_index + 1) % FILTER_SIZE;
@@ -145,15 +156,30 @@ void updateFilter(AnchorData &a) {
     for (int i = 0; i < FILTER_SIZE; i++)
         if (a.distance_history[i] >= MIN_DISTANCE && a.distance_history[i] <= MAX_DISTANCE)
             valid[cnt++] = a.distance_history[i];
-    a.filtered_distance = (cnt > 0) ? calcMedian(valid, cnt) : 0;
+    float median = (cnt > 0) ? calcMedian(valid, cnt) : 0;
+    // Apply EMA on top of median to further smooth without adding lag
+    if (a.ema_distance < 0) {
+        a.ema_distance = median;  // seed on first reading
+    } else {
+        a.ema_distance = EMA_ALPHA * median + (1.0f - EMA_ALPHA) * a.ema_distance;
+    }
+    a.filtered_distance = a.ema_distance;
 }
 
 // ==================== TDMA ====================
 
 void waitForSlot() {
     unsigned long cycle = (unsigned long)NUM_TAGS * SLOT_DURATION_MS;
-    unsigned long now = millis();
-    unsigned long pos = now % cycle;
+    if (!synced) {
+        unsigned long pos = millis() % cycle;
+        unsigned long my_start = (unsigned long)my_slot * SLOT_DURATION_MS;
+        if (pos < my_start) delay(my_start - pos);
+        else if (pos >= my_start + SLOT_DURATION_MS) delay(cycle - pos + my_start);
+        slot_start_ms = millis();
+        return;
+    }
+    unsigned long elapsed = millis() - cycle_epoch_ms;
+    unsigned long pos = elapsed % cycle;
     unsigned long my_start = (unsigned long)my_slot * SLOT_DURATION_MS;
     unsigned long wait = 0;
     if (pos <= my_start) wait = my_start - pos;
@@ -227,6 +253,35 @@ DWM3000Class DWM3000;
 bool rangeWithAnchor(int idx);
 void broadcastDistances();
 
+// ==================== SYNC ====================
+
+bool waitForSyncBeacon(unsigned long timeout_ms) {
+    DWM3000.forceIdle();
+    DWM3000.clearSystemStatus();
+    DWM3000.standardRX();
+    unsigned long t0 = millis();
+    while ((millis() - t0) < timeout_ms) {
+        int rx = DWM3000.receivedFrameSucc();
+        if (rx == 1) {
+            int stage = DWM3000.ds_getStage();
+            int dest  = DWM3000.getDestinationID();
+            DWM3000.clearSystemStatus();
+            if (stage == STAGE_SYNC && dest == 0xFF) {
+                cycle_epoch_ms = millis();
+                synced = true;
+                Serial.println("# [SYNC] Beacon received");
+                DWM3000.forceIdle();
+                return true;
+            }
+            DWM3000.standardRX();
+        } else if (rx == 2) {
+            DWM3000.clearSystemStatus();
+            DWM3000.standardRX();
+        }
+    }
+    return false;
+}
+
 // ==================== BROADCAST ====================
 // KEY FIX: Use standardTX() for broadcast (fire-and-forget).
 // The old code used TXInstantRX() which auto-transitions to RX after TX.
@@ -249,7 +304,8 @@ void broadcastDistances() {
     DWM3000.write(TX_BUFFER_REG, 0x03, STAGE_BCAST & 0x7);
 
     for (int i = 0; i < NUM_ANCHORS; i++) {
-        uint16_t d = (uint16_t)(anchors[i].filtered_distance);
+        // Store as tenths of cm (mm resolution) to preserve sub-cm precision
+        uint16_t d = (uint16_t)(anchors[i].filtered_distance * 10.0f);
         DWM3000.write(TX_BUFFER_REG, 0x04 + (i * 2), d, 2);
     }
 
@@ -258,7 +314,7 @@ void broadcastDistances() {
         DWM3000.write(TX_BUFFER_REG, 0x04 + (NUM_ANCHORS * 2) + (i * 2), (uint16_t)r, 2);
     }
 
-    DWM3000.setFrameLength(3 + NUM_ANCHORS * 4);
+    DWM3000.setFrameLength(4 + NUM_ANCHORS * 4);  // FIX: 4 header bytes (mode+sender+dest+stage), not 3
 
     // Clear status bits RIGHT before TX
     DWM3000.clearSystemStatus();
@@ -376,10 +432,6 @@ bool rangeWithAnchor(int idx) {
         a->distance = DWM3000.convertToCM(tof);
         updateFilter(*a);
         stat_ok++;
-
-        Serial.print("[DIST] A"); Serial.print(aid);
-        Serial.print(": "); Serial.print(a->filtered_distance, 1);
-        Serial.println("cm");
 
         DWM3000.forceIdle();
         DWM3000.clearSystemStatus();
@@ -584,12 +636,28 @@ void setup() {
     DWM3000.setSenderID(TAG_ID);
     DWM3000.configureAsTX();
     DWM3000.clearSystemStatus();
+
+    Serial.println("# Waiting for sync beacon...");
+    if (waitForSyncBeacon(SYNC_TIMEOUT_MS)) {
+        Serial.println("# [SYNC] Aligned");
+    } else {
+        Serial.println("# [SYNC] No beacon, free-running");
+        cycle_epoch_ms = millis();
+        synced = true;
+    }
+
     Serial.println("[OK] Tag ready\n");
 }
 
 // ==================== MAIN LOOP ====================
 
+#define RESYNC_EVERY_N_CYCLES 50
+
 void loop() {
+    cycle_count++;
+    if (cycle_count % RESYNC_EVERY_N_CYCLES == 0) {
+        waitForSyncBeacon((unsigned long)NUM_TAGS * SLOT_DURATION_MS);
+    }
     waitForSlot();
     for (int a = 0; a < NUM_ANCHORS; a++) {
         if (slotExpired()) break;

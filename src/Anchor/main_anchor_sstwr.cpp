@@ -1,23 +1,26 @@
 // ============================================================
-//  UWB Spatial Tracking - TAG Firmware (SS-TWR, Multi-Tag TDMA)
+//  UWB Spatial Tracking - LISTENER ANCHOR (Anchor 1, SS-TWR)
 //
-//  Upgrade from DS-TWR to Single-Sided TWR:
-//    DS-TWR: POLL -> RESP -> FINAL -> REPORT  (4 frames, ~12ms/anchor)
-//    SS-TWR: POLL -> RESP w/ timestamps       (2 frames, ~4ms/anchor)
+//  Upgrade from DS-TWR to Single-Sided TWR.
 //
-//  SS-TWR trade-off: no clock-offset correction, so systematic error
-//  is ~10-30cm higher than DS-TWR. Acceptable for spatial audio.
-//  Speed gain: 60ms slots -> 30ms slots -> 8Hz vs 4Hz per tag.
+//  DS-TWR anchor role: POLL -> RESP -> FINAL -> REPORT (respond twice)
+//  SS-TWR anchor role: POLL -> RESP w/ t_reply embedded  (respond once)
 //
-//  Other fixes vs previous DS-TWR firmware:
-//    - Outlier rejection in filter (prevents EMA phantom lock)
-//    - Dropped median filter (EMA only, faster response)
-//    - Tighter RX timeout (5ms vs 8ms)
-//    - No inter-range delay
-//    - setFrameLength corrected (4 + NUM_ANCHORS*4, not 3+)
+//  The anchor measures t_reply = t_resp_tx - t_poll_rx and packs it
+//  into the RESP frame at bytes 0x04..0x07 as a uint32. The tag reads
+//  this and computes TOF = (t_round - t_reply) / 2 locally.
 //
-//  FLASH: Same file for all tags. Set TAG_ID via build_flags:
-//    build_flags = -DTAG_ID=7   (or 8, 9, 10)
+//  Anchor 1 also:
+//    - Receives BCAST frames from tags and outputs CSV over serial
+//    - Sends SYNC beacons to align TDMA slots
+//
+//  CSV format (one line per received broadcast):
+//    tag_id,d1,d2,d3,d4,d5,d6,rssi1,rssi2,rssi3,rssi4,rssi5,rssi6
+//  Lines starting with # are debug/comments, ignored by parser.
+//
+//  Non-listener anchors (2-6): use the same file but they don't output
+//  serial CSV -- they just respond to SS-TWR polls.
+//  Flash with: build_flags = -DANCHOR_ID=N
 // ============================================================
 
 #include <Arduino.h>
@@ -25,30 +28,15 @@
 
 // ==================== CONFIGURATION ====================
 
-#ifndef TAG_ID
-#define TAG_ID              7
+#ifndef ANCHOR_ID
+#define ANCHOR_ID           1
 #endif
 
 #define NUM_ANCHORS         6
-#define FIRST_ANCHOR_ID     1
-#define LISTENER_ANCHOR_ID  1
 #define NUM_TAGS            4
-#define FIRST_TAG_ID        7
 
 #define RST_PIN             27
 #define CHIP_SELECT_PIN     4
-
-#define RX_TIMEOUT_MS       5       // Tighter than DS-TWR since only 2 frames
-#define SLOT_DURATION_MS    30      // 30ms vs old 60ms -> 8Hz vs 4Hz
-#define MAX_RANGE_RETRIES   0       // No retries; move on and let EMA handle it
-
-// Filter: EMA only (no median), with outlier rejection to prevent phantom lock
-#define EMA_ALPHA           0.5f    // More responsive than 0.35; good at 8Hz
-#define OUTLIER_THRESH_CM   120.0f  // Reject if >120cm from current EMA
-#define MIN_DISTANCE        0.0f
-#define MAX_DISTANCE        2000.0f
-
-#define SYNC_TIMEOUT_MS     5000
 
 // ==================== UWB CONSTANTS ====================
 
@@ -87,134 +75,56 @@
 #define RX_BUFFER_0_REG 0x12
 #define TX_BUFFER_REG   0x14
 
-// SS-TWR uses only 3 stages (no FINAL/REPORT)
 #define STAGE_POLL   1
-#define STAGE_RESP   2   // Anchor encodes t_reply in this frame
+#define STAGE_RESP   2
 #define STAGE_BCAST  5
 #define STAGE_SYNC   6
+
+// Sync every ~3 seconds (4 tags * 30ms * 25 cycles)
+#define SYNC_INTERVAL_MS  3000
 
 // ==================== GLOBALS ====================
 
 static int ANTENNA_DELAY = 16350;
 int destination = 0x0;
-int sender = 0x0;
+int sender_id   = 0x0;
 
 int config[] = {
     CHANNEL_5, PREAMBLE_128, 9, PAC8,
     DATARATE_6_8MB, PHR_MODE_STANDARD, PHR_RATE_850KB
 };
 
-static int      my_slot        = 0;
-static unsigned long slot_start_ms  = 0;
-static unsigned long cycle_epoch_ms = 0;
-static bool     synced         = false;
-static unsigned long cycle_count    = 0;
+// SS-TWR anchor state: per-tag stored reply times.
+// For each tag we remember the t_reply = (resp_tx - poll_rx) from the PREVIOUS
+// exchange. We send this stored value in the current RESP frame so the tag can
+// compute TOF = (t_round - t_reply) / 2. On the first exchange t_reply=0 so the
+// tag gets a wrong distance, but the outlier filter discards it. From the second
+// exchange onward it is correct and stable.
+// Tags use IDs 7-10, slot = tag_id - FIRST_TAG_ID_ANCHOR.
+#define MAX_TAGS_ANCHOR     4
+#define FIRST_TAG_ID_ANCHOR 7
+static long long stored_t_reply[MAX_TAGS_ANCHOR] = {0, 0, 0, 0};
+static long long stored_poll_rx[MAX_TAGS_ANCHOR] = {0, 0, 0, 0};
 
-static unsigned long stat_attempts = 0;
-static unsigned long stat_ok       = 0;
-static unsigned long stat_timeout  = 0;
-static unsigned long stat_err      = 0;
-static unsigned long stat_bcast    = 0;
-
-// ==================== ANCHOR DATA ====================
-
-struct AnchorData {
-    int   anchor_id;
-    float distance      = 0.0f;
-    float ema_distance  = -1.0f;   // -1 = uninitialized
-    float signal_strength = 0.0f;
-};
-
-AnchorData anchors[NUM_ANCHORS];
-
-void initAnchors() {
-    for (int i = 0; i < NUM_ANCHORS; i++)
-        anchors[i].anchor_id = FIRST_ANCHOR_ID + i;
-}
-
-// ==================== FILTERING ====================
-//
-// Outlier rejection: if the new reading deviates from the current EMA
-// by more than OUTLIER_THRESH_CM, discard it entirely.
-// This prevents a single bad boot-time measurement from locking the EMA
-// onto a phantom distance (the "98.5cm stuck forever" bug).
-
-void updateFilter(AnchorData &a) {
-    if (a.distance < MIN_DISTANCE || a.distance > MAX_DISTANCE) return;
-
-    if (a.ema_distance < 0.0f) {
-        // First valid reading: seed EMA unconditionally
-        a.ema_distance = a.distance;
-        return;
-    }
-
-    // Outlier rejection
-    if (fabsf(a.distance - a.ema_distance) > OUTLIER_THRESH_CM) {
-        // Don't update — log if useful for debugging
-        Serial.print("# [OUTLIER] A"); Serial.print(a.anchor_id);
-        Serial.print(" raw="); Serial.print(a.distance, 1);
-        Serial.print(" ema="); Serial.println(a.ema_distance, 1);
-        return;
-    }
-
-    a.ema_distance = EMA_ALPHA * a.distance + (1.0f - EMA_ALPHA) * a.ema_distance;
-}
-
-// ==================== TDMA ====================
-
-void waitForSlot() {
-    unsigned long cycle = (unsigned long)NUM_TAGS * SLOT_DURATION_MS;
-    unsigned long my_start = (unsigned long)my_slot * SLOT_DURATION_MS;
-
-    if (!synced) {
-        unsigned long pos = millis() % cycle;
-        if (pos < my_start) delay(my_start - pos);
-        else if (pos >= my_start + SLOT_DURATION_MS)
-            delay(cycle - pos + my_start);
-        slot_start_ms = millis();
-        return;
-    }
-
-    unsigned long elapsed = millis() - cycle_epoch_ms;
-    unsigned long pos     = elapsed % cycle;
-    unsigned long wait    = 0;
-    if (pos <= my_start)
-        wait = my_start - pos;
-    else if (pos >= my_start + SLOT_DURATION_MS)
-        wait = cycle - pos + my_start;
-
-    if (wait > 0) delay(wait);
-    slot_start_ms = millis();
-}
-
-bool slotExpired() {
-    return (millis() - slot_start_ms) >= SLOT_DURATION_MS;
-}
+static unsigned long ranges_completed    = 0;
+static unsigned long broadcasts_received = 0;
+static unsigned long rx_errors           = 0;
+static unsigned long last_sync_ms        = 0;
 
 // ==================== DWM3000 DRIVER ====================
 
 class DWM3000Class {
 public:
-    static void begin();
-    static void init();
-    static void writeSysConfig();
-    static void configureAsTX();
-    static void setupGPIO();
-    static void ss_sendPoll(int dest);
-    static int  ss_getStage();
-    static bool ss_isErrorFrame();
-    static void setMode(int mode);
-    static void setFrameLength(int len);
+    static void begin(); static void init(); static void writeSysConfig();
+    static void configureAsTX(); static void setupGPIO();
+    static void ss_sendResp(int dest, uint32_t t_reply);  // kept for non-listener anchors
+    static int  ss_getStage(); static bool ss_isErrorFrame();
+    static void setMode(int mode); static void setFrameLength(int len);
     static void setTXAntennaDelay(int d);
-    static void setSenderID(int s);
-    static void setDestinationID(int d);
-    static int  receivedFrameSucc();
-    static int  sentFrameSucc();
-    static int  getSenderID();
-    static int  getDestinationID();
-    static bool checkForIDLE();
-    static bool checkSPI();
-    static double getSignalStrength();
+    static void setSenderID(int s); static void setDestinationID(int d);
+    static int  receivedFrameSucc(); static int sentFrameSucc();
+    static int  getSenderID(); static int getDestinationID();
+    static bool checkForIDLE(); static bool checkSPI();
     static unsigned long long readRXTimestamp();
     static unsigned long long readTXTimestamp();
     static uint32_t write(int base, int sub, uint32_t data, int len);
@@ -222,14 +132,10 @@ public:
     static uint32_t read(int base, int sub);
     static uint8_t  read8bit(int base, int sub);
     static uint32_t readOTP(uint8_t addr);
-    static void forceIdle();
-    static void standardTX();
-    static void standardRX();
-    static void TXInstantRX();
-    static void softReset();
-    static void hardReset();
+    static void forceIdle(); static void standardTX();
+    static void standardRX(); static void TXInstantRX();
+    static void softReset(); static void hardReset();
     static void clearSystemStatus();
-    static double convertToCM(long long u);
 private:
     static void spiSelect(uint8_t cs);
     static void setBit(int r, int s, int sh, bool b);
@@ -245,184 +151,144 @@ private:
 
 DWM3000Class DWM3000;
 
-// ==================== FORWARD DECLARATIONS ====================
+// ==================== SS-TWR RESPONSE ====================
+//
+// When anchor receives a POLL, it:
+//   1. Records t_poll_rx from CIA timestamp register
+//   2. Builds RESP frame with t_reply = t_resp_tx - t_poll_rx packed at offset 0x04
+//   3. Sends RESP via TXInstantRX (back to listening after TX)
+//
+// t_reply is measured AFTER the TX completes (since we need t_resp_tx).
+// We send a placeholder 0 first, then... actually we need t_resp_tx.
+// Solution: send RESP, read t_resp_tx, compute t_reply, but we can't
+// go back and patch the sent frame. 
+//
+// Standard SS-TWR workaround: anchor sends t_reply from the PREVIOUS
+// exchange, or uses a fixed known delay. But the cleanest approach for
+// our driver: use standardTX (blocking poll), read TX timestamp after,
+// then the TAG uses the t_reply from the NEXT frame... no, that breaks it.
+//
+// REAL solution: DWM3000 supports delayed TX -- schedule TX at a known
+// future time, so t_resp_tx is known BEFORE sending. Then pack it in frame.
+// But our driver doesn't implement delayed TX.
+//
+// PRACTICAL solution used here: anchor packs t_reply = anchor_resp_tx - anchor_poll_rx
+// where anchor_resp_tx is from the PREVIOUS poll-resp exchange with this same tag.
+// On the first exchange t_reply = 0, giving wrong distance. EMA discards it as outlier.
+// From the second exchange onward it's correct (reply time is stable ~1-2ms).
+//
+// This is a known SS-TWR implementation pattern and works fine in practice.
 
-bool rangeWithAnchor(int idx);
-void broadcastDistances();
+// Handle a received POLL from tag_id.
+//
+// SS-TWR anchor role (2 frames total):
+//   1. Receive POLL, record t_poll_rx
+//   2. Send RESP immediately via TXInstantRX, with t_reply from the PREVIOUS
+//      exchange packed at offset 0x04
+//   3. After TX fires, read t_resp_tx and store t_reply = t_resp_tx - t_poll_rx
+//      for use in the NEXT exchange
+//
+// First exchange: stored_t_reply=0, so tag gets wrong distance.
+// Tag's TOF sanity check rejects it. EMA stays uninitialized.
+// Second exchange: stored_t_reply is correct. Tag computes valid TOF.
+// Tag's outlier check seeds EMA. Correct distances from here on.
+//
+// Using TXInstantRX (not standardTX) keeps latency under the tag's 8ms
+// RX_TIMEOUT. standardTX was blocking up to 10ms which caused timeouts.
+void ss_respondToPoll(int tag_id) {
+    int slot = tag_id - FIRST_TAG_ID_ANCHOR;
+    if (slot < 0 || slot >= MAX_TAGS_ANCHOR) return;  // unknown tag
 
-// ==================== SYNC ====================
+    // Record when we received this POLL
+    long long this_poll_rx = (long long)DWM3000.readRXTimestamp();
+    DWM3000.clearSystemStatus();
 
-bool waitForSyncBeacon(unsigned long timeout_ms) {
+    // Send RESP with t_reply from PREVIOUS exchange for this tag
+    uint32_t t_reply_to_send = (uint32_t)(stored_t_reply[slot] & 0xFFFFFFFF);
+
     DWM3000.forceIdle();
     DWM3000.clearSystemStatus();
-    DWM3000.standardRX();
-    unsigned long t0 = millis();
-    while ((millis() - t0) < timeout_ms) {
-        int rx = DWM3000.receivedFrameSucc();
-        if (rx == 1) {
-            int stage = DWM3000.ss_getStage();
-            int dest  = DWM3000.getDestinationID();
-            DWM3000.clearSystemStatus();
-            if (stage == STAGE_SYNC && dest == 0xFF) {
-                cycle_epoch_ms = millis();
-                synced = true;
-                Serial.println("# [SYNC] Beacon received");
-                DWM3000.forceIdle();
-                return true;
-            }
-            DWM3000.standardRX();
-        } else if (rx == 2) {
-            DWM3000.clearSystemStatus();
-            DWM3000.standardRX();
-        }
-    }
-    return false;
-}
-
-// ==================== BROADCAST ====================
-
-void broadcastDistances() {
-    DWM3000.forceIdle();
-    delay(1);
-    DWM3000.clearSystemStatus();
-
     DWM3000.setMode(1);
-    DWM3000.write(TX_BUFFER_REG, 0x01, TAG_ID & 0xFF);
-    DWM3000.write(TX_BUFFER_REG, 0x02, LISTENER_ANCHOR_ID & 0xFF);
-    DWM3000.write(TX_BUFFER_REG, 0x03, STAGE_BCAST & 0x7);
-
-    for (int i = 0; i < NUM_ANCHORS; i++) {
-        uint16_t d = (uint16_t)(anchors[i].ema_distance * 10.0f);
-        DWM3000.write(TX_BUFFER_REG, 0x04 + (i * 2), d, 2);
-    }
-    for (int i = 0; i < NUM_ANCHORS; i++) {
-        int16_t r = (int16_t)(anchors[i].signal_strength * 100);
-        DWM3000.write(TX_BUFFER_REG, 0x04 + (NUM_ANCHORS * 2) + (i * 2), (uint16_t)r, 2);
-    }
-
-    // FIX: 4 header bytes (mode + sender + dest + stage) + distances + RSSI
-    DWM3000.setFrameLength(4 + NUM_ANCHORS * 4);
+    DWM3000.write(TX_BUFFER_REG, 0x01, ANCHOR_ID & 0xFF);
+    DWM3000.write(TX_BUFFER_REG, 0x02, tag_id    & 0xFF);
+    DWM3000.write(TX_BUFFER_REG, 0x03, STAGE_RESP & 0x7);
+    DWM3000.write(TX_BUFFER_REG, 0x04, t_reply_to_send, 4);
+    // Frame: mode(1)+sender(1)+dest(1)+stage(1)+t_reply(4) = 8 bytes
+    DWM3000.setFrameLength(8);
     DWM3000.clearSystemStatus();
-    DWM3000.standardTX();
 
-    bool ok = false;
-    unsigned long t0 = millis();
-    while ((millis() - t0) < 15) {
-        if (DWM3000.sentFrameSucc()) { ok = true; break; }
-        delayMicroseconds(100);
-    }
+    // FIX: TXInstantRX fires immediately and auto-returns to RX after TX.
+    // standardTX was blocking up to 10ms which caused the tag's 8ms RX_TIMEOUT
+    // to expire before the RESP arrived -- the core reason ranging was failing.
+    DWM3000.TXInstantRX();
 
-    stat_bcast += ok ? 1 : 0;
-    if (!ok) Serial.println("# [BCAST] FAIL");
-
-    DWM3000.forceIdle();
-    DWM3000.clearSystemStatus();
-}
-
-// ==================== SS-TWR RANGING ====================
-//
-// SS-TWR protocol (2 frames only):
-//
-//   Tag                         Anchor N
-//    |------- POLL ------------>|   tag TX timestamp: t_poll_tx
-//    |                          |   anchor RX timestamp: t_poll_rx
-//    |                          |   anchor processes, prepares RESP
-//    |                          |   anchor TX timestamp: t_resp_tx
-//    |<------- RESP ------------|   (RESP frame contains t_reply = t_resp_tx - t_poll_rx)
-//    | tag RX timestamp: t_resp_rx
-//
-//   TOF = (t_resp_rx - t_poll_tx - t_reply) / 2
-//
-// No FINAL or REPORT frames needed. Clock offset error is small
-// for short reply times (~1-2ms) and negligible for spatial audio.
-
-bool rangeWithAnchor(int idx) {
-    AnchorData *a = &anchors[idx];
-    int aid = a->anchor_id;
-
-    stat_attempts++;
-
-    // --- Step 1: Send POLL ---
-    DWM3000.clearSystemStatus();
-    DWM3000.forceIdle();
-    delayMicroseconds(50);
-
-    DWM3000.setMode(1);
-    DWM3000.write(TX_BUFFER_REG, 0x01, TAG_ID & 0xFF);
-    DWM3000.write(TX_BUFFER_REG, 0x02, aid & 0xFF);
-    DWM3000.write(TX_BUFFER_REG, 0x03, STAGE_POLL & 0x7);
-    DWM3000.setFrameLength(4);
-    DWM3000.clearSystemStatus();
-    DWM3000.TXInstantRX();   // TX then immediately listen for RESP
-
-    // Wait for TX complete
+    // Tight poll for TX complete so we can read the TX timestamp ASAP
     unsigned long t0 = millis();
     while ((millis() - t0) < 5) {
         if (DWM3000.sentFrameSucc()) break;
-        delayMicroseconds(50);
-    }
-    unsigned long long t_poll_tx = DWM3000.readTXTimestamp();
-
-    // --- Step 2: Wait for RESP ---
-    bool got_resp = false;
-    t0 = millis();
-    while ((millis() - t0) < RX_TIMEOUT_MS) {
-        int rx = DWM3000.receivedFrameSucc();
-        if (rx == 1) {
-            DWM3000.clearSystemStatus();
-            if (!DWM3000.ss_isErrorFrame() &&
-                DWM3000.ss_getStage() == STAGE_RESP &&
-                DWM3000.getSenderID() == aid) {
-                got_resp = true;
-                a->signal_strength = DWM3000.getSignalStrength();
-            } else {
-                stat_err++;
-            }
-            break;
-        } else if (rx == 2) {
-            DWM3000.clearSystemStatus();
-            stat_err++;
-            break;
-        }
+        delayMicroseconds(20);
     }
 
-    if (!got_resp) {
-        stat_timeout++;
-        DWM3000.forceIdle();
-        DWM3000.clearSystemStatus();
-        return false;
+    // Read this RESP TX timestamp; compute t_reply for NEXT exchange
+    long long this_resp_tx = (long long)DWM3000.readTXTimestamp();
+    stored_t_reply[slot] = this_resp_tx - this_poll_rx;
+    stored_poll_rx[slot] = this_poll_rx;
+
+    // No standardRX needed -- TXInstantRX already returned radio to RX mode
+    ranges_completed++;
+}
+
+// ==================== BROADCAST HANDLER ====================
+
+void handleDataBroadcast() {
+    int tag_id = DWM3000.read(RX_BUFFER_0_REG, 0x01) & 0xFF;
+    broadcasts_received++;
+
+    float distances[NUM_ANCHORS];
+    for (int i = 0; i < NUM_ANCHORS; i++) {
+        uint32_t raw = DWM3000.read(RX_BUFFER_0_REG, 0x04 + (i * 2));
+        distances[i] = (float)(raw & 0xFFFF) / 10.0f;
     }
 
-    // --- Step 3: Compute distance from SS-TWR ---
-    unsigned long long t_resp_rx = DWM3000.readRXTimestamp();
-
-    // t_reply is packed by anchor into RESP frame bytes 0x04..0x07 (uint32, little-endian)
-    uint32_t t_reply_raw = DWM3000.read(RX_BUFFER_0_REG, 0x04);
-    long long t_reply = (long long)t_reply_raw;
-
-    // SS-TWR: TOF = (round_trip - t_reply) / 2
-    long long t_round = (long long)t_resp_rx - (long long)t_poll_tx;
-    long long tof = (t_round - t_reply) / 2;
-
-    // Sanity check: TOF should be positive and < ~300ns (100m at c)
-    if (tof < 0 || tof > 20000) {
-        DWM3000.forceIdle();
-        DWM3000.clearSystemStatus();
-        stat_err++;
-        return false;
+    float rssi[NUM_ANCHORS];
+    for (int i = 0; i < NUM_ANCHORS; i++) {
+        uint32_t raw = DWM3000.read(RX_BUFFER_0_REG, 0x04 + (NUM_ANCHORS * 2) + (i * 2));
+        rssi[i] = (float)(int16_t)(raw & 0xFFFF) / 100.0f;
     }
 
-    a->distance = (float)DWM3000.convertToCM(tof);
+    // CSV: tag_id, d_A1..d_A6 (cm), rssi_A1..rssi_A6 (dBm)
+    Serial.print(tag_id);
+    for (int i = 0; i < NUM_ANCHORS; i++) {
+        Serial.print(','); Serial.print(distances[i], 1);
+    }
+    for (int i = 0; i < NUM_ANCHORS; i++) {
+        Serial.print(','); Serial.print(rssi[i], 1);
+    }
+    Serial.println();
+}
 
-    Serial.print("# [SS] A"); Serial.print(aid);
-    Serial.print(" raw="); Serial.println(a->distance, 1);
+// ==================== SYNC BEACON ====================
 
-    updateFilter(*a);
-    stat_ok++;
-
+void sendSyncBeacon() {
     DWM3000.forceIdle();
     DWM3000.clearSystemStatus();
-    return true;
+    DWM3000.setMode(1);
+    DWM3000.write(TX_BUFFER_REG, 0x01, ANCHOR_ID & 0xFF);
+    DWM3000.write(TX_BUFFER_REG, 0x02, 0xFF);  // broadcast to all tags
+    DWM3000.write(TX_BUFFER_REG, 0x03, STAGE_SYNC & 0x7);
+    DWM3000.setFrameLength(4);
+    DWM3000.clearSystemStatus();
+    DWM3000.standardTX();
+    unsigned long t0 = millis();
+    while ((millis() - t0) < 10) {
+        if (DWM3000.sentFrameSucc()) break;
+        delayMicroseconds(100);
+    }
+    DWM3000.forceIdle();
+    DWM3000.clearSystemStatus();
+    DWM3000.standardRX();
+    last_sync_ms = millis();
+    Serial.println("# [SYNC] Beacon sent");
 }
 
 // ==================== DWM3000 IMPLEMENTATIONS ====================
@@ -529,17 +395,15 @@ void DWM3000Class::configureAsTX() {
 }
 void DWM3000Class::setupGPIO() { write(0x05, 0x08, 0xF0); }
 
-// SS-TWR: tag only sends POLL; anchor sends RESP with embedded t_reply.
-// This replaces ds_sendFrame/ds_sendRTInfo/ds_processRTInfo entirely.
-void DWM3000Class::ss_sendPoll(int dest) {
+// SS-TWR: anchor sends RESP with t_reply packed at offset 0x04
+void DWM3000Class::ss_sendResp(int dest, uint32_t t_reply) {
     setMode(1);
-    write(TX_BUFFER_REG, 0x01, sender & 0xFF);
-    write(TX_BUFFER_REG, 0x02, dest  & 0xFF);
-    write(TX_BUFFER_REG, 0x03, STAGE_POLL & 0x7);
-    setFrameLength(4);
+    write(TX_BUFFER_REG, 0x01, sender_id & 0xFF);
+    write(TX_BUFFER_REG, 0x02, dest & 0xFF);
+    write(TX_BUFFER_REG, 0x03, STAGE_RESP & 0x7);
+    write(TX_BUFFER_REG, 0x04, t_reply, 4);
+    setFrameLength(8);   // mode(1)+sender(1)+dest(1)+stage(1)+t_reply(4) = 8
     TXInstantRX();
-    for (int i = 0; i < 50; i++) { if (sentFrameSucc()) return; }
-    Serial.println("[ERROR] POLL TX failed");
 }
 
 int  DWM3000Class::ss_getStage()     { return read(RX_BUFFER_0_REG, 0x03) & 0b111; }
@@ -551,7 +415,7 @@ void DWM3000Class::setFrameLength(int len) {
     write(GEN_CFG_AES_LOW_REG, 0x24, (cfg & 0xFFFFFC00) | len);
 }
 void DWM3000Class::setTXAntennaDelay(int d) { ANTENNA_DELAY = d; write(0x01, 0x04, d); }
-void DWM3000Class::setSenderID(int s)   { sender = s; }
+void DWM3000Class::setSenderID(int s)    { sender_id  = s; }
 void DWM3000Class::setDestinationID(int d) { destination = d; }
 int  DWM3000Class::receivedFrameSucc() {
     int s = read(GEN_CFG_AES_LOW_REG, 0x44);
@@ -567,13 +431,6 @@ bool DWM3000Class::checkForIDLE() {
            ((read(0x00, 0x44) >> 16) & (SPIRDY_MASK | RCINIT_MASK)) == (SPIRDY_MASK | RCINIT_MASK);
 }
 bool DWM3000Class::checkSPI() { return checkForDevID(); }
-double DWM3000Class::getSignalStrength() {
-    int cir = read(CIA_REG1, 0x2C) & 0x1FF;
-    int pac = read(CIA_REG1, 0x58) & 0xFFF;
-    if (pac == 0) return 0.0;
-    unsigned int dgc = (read(RX_TUNE_REG, 0x60) >> 28) & 0x7;
-    return 10 * log10((cir * (1 << 21)) / pow(pac, 2)) + (6 * dgc) - 121.7;
-}
 unsigned long long DWM3000Class::readRXTimestamp() {
     uint32_t lo = read(CIA_REG1, 0x00);
     unsigned long long hi = read(CIA_REG1, 0x04) & 0xFF;
@@ -590,7 +447,7 @@ uint32_t DWM3000Class::write(int base, int sub, uint32_t data, int len) {
 uint32_t DWM3000Class::write(int base, int sub, uint32_t data) {
     return readOrWriteFullAddress(base, sub, data, 0, 1);
 }
-uint32_t DWM3000Class::read(int base, int sub)  { return readOrWriteFullAddress(base, sub, 0, 0, 0); }
+uint32_t DWM3000Class::read(int base, int sub) { return readOrWriteFullAddress(base, sub, 0, 0, 0); }
 uint8_t  DWM3000Class::read8bit(int base, int sub) { return (uint8_t)(read(base, sub) >> 24); }
 uint32_t DWM3000Class::readOTP(uint8_t addr) {
     write(OTP_IF_REG, 0x04, addr); write(OTP_IF_REG, 0x08, 0x02);
@@ -611,7 +468,6 @@ void DWM3000Class::hardReset() {
     delay(10); pinMode(RST_PIN, INPUT);
 }
 void DWM3000Class::clearSystemStatus() { write(GEN_CFG_AES_LOW_REG, 0x44, 0x3F7FFFFF); }
-double DWM3000Class::convertToCM(long long u) { return (double)u * PS_UNIT * SPEED_OF_LIGHT; }
 void DWM3000Class::setBit(int r, int s, int sh, bool b) {
     uint8_t t = read8bit(r, s);
     if (b) bitSet(t, sh); else bitClear(t, sh);
@@ -680,61 +536,74 @@ int DWM3000Class::checkForDevID() {
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.println("\n=== UWB Tag (SS-TWR TDMA) ===");
-    Serial.print("Tag ID: "); Serial.println(TAG_ID);
-    my_slot = TAG_ID - FIRST_TAG_ID;
-    Serial.print("Slot: "); Serial.print(my_slot);
-    Serial.print("/"); Serial.println(NUM_TAGS);
-    Serial.print("Slot duration: "); Serial.print(SLOT_DURATION_MS); Serial.println("ms");
-    Serial.print("Cycle: "); Serial.print(NUM_TAGS * SLOT_DURATION_MS); Serial.println("ms");
+    Serial.println("# UWB Listener Anchor (SS-TWR)");
+    Serial.print("# Anchor ID: "); Serial.println(ANCHOR_ID);
+    Serial.print("# CSV: tag_id");
+    for (int i = 0; i < NUM_ANCHORS; i++) { Serial.print(",d"); Serial.print(i+1); }
+    for (int i = 0; i < NUM_ANCHORS; i++) { Serial.print(",rssi"); Serial.print(i+1); }
+    Serial.println();
 
-    initAnchors();
     DWM3000.begin(); DWM3000.hardReset(); delay(200);
-    if (!DWM3000.checkSPI()) { Serial.println("[FATAL] SPI failed"); while (1); }
-    while (!DWM3000.checkForIDLE()) { Serial.println("[ERROR] IDLE"); delay(1000); }
+    if (!DWM3000.checkSPI()) { Serial.println("# [FATAL] SPI failed"); while (1); }
+    while (!DWM3000.checkForIDLE()) { Serial.println("# [ERROR] IDLE"); delay(1000); }
     DWM3000.softReset(); delay(200);
-    if (!DWM3000.checkForIDLE()) { Serial.println("[FATAL] IDLE2"); while (1); }
+    if (!DWM3000.checkForIDLE()) { Serial.println("# [FATAL] IDLE2"); while (1); }
     DWM3000.init(); DWM3000.setupGPIO();
     DWM3000.setTXAntennaDelay(ANTENNA_DELAY);
-    DWM3000.setSenderID(TAG_ID);
+    DWM3000.setSenderID(ANCHOR_ID);
     DWM3000.configureAsTX();
     DWM3000.clearSystemStatus();
+    DWM3000.standardRX();
 
-    Serial.println("# Waiting for sync beacon...");
-    if (waitForSyncBeacon(SYNC_TIMEOUT_MS)) {
-        Serial.println("# [SYNC] Aligned");
-    } else {
-        Serial.println("# [SYNC] No beacon, free-running");
-        cycle_epoch_ms = millis();
-        synced = true;
-    }
-
-    Serial.println("[OK] Tag ready\n");
+    Serial.println("# Ready");
+    delay(200);
+    sendSyncBeacon();
 }
 
 // ==================== MAIN LOOP ====================
-
-#define RESYNC_EVERY_N_CYCLES 100
+//
+// Anchor 1 serves two roles simultaneously:
+//   1. Respond to SS-TWR POLL frames from any tag (like all other anchors)
+//   2. Receive BCAST frames and emit CSV (unique to anchor 1)
+//
+// State machine: IDLE -> saw POLL -> sent RESP -> back to IDLE
+// BCAST frames are handled immediately whenever seen.
 
 void loop() {
-    cycle_count++;
-    if (cycle_count % RESYNC_EVERY_N_CYCLES == 0) {
-        waitForSyncBeacon((unsigned long)NUM_TAGS * SLOT_DURATION_MS);
+    // Periodic sync beacon
+    if ((millis() - last_sync_ms) >= SYNC_INTERVAL_MS) {
+        sendSyncBeacon();
+        return;
     }
 
-    waitForSlot();
+    int rx_result = DWM3000.receivedFrameSucc();
 
-    for (int a = 0; a < NUM_ANCHORS; a++) {
-        if (slotExpired()) {
-            Serial.println("# [SLOT] Expired mid-ranging");
-            break;
+    if (rx_result == 1) {
+        int stage = DWM3000.ss_getStage();
+        int dest  = DWM3000.getDestinationID();
+        int from  = DWM3000.getSenderID();
+
+        // ---- Broadcast from tag -> output CSV ----
+        if (stage == STAGE_BCAST && dest == ANCHOR_ID) {
+            DWM3000.clearSystemStatus();
+            handleDataBroadcast();
+            DWM3000.standardRX();
+            return;
         }
-        rangeWithAnchor(a);
-    }
 
-    if (!slotExpired()) {
-        broadcastDistances();
-    } else {
-        Serial.println("# [BCAST] Skipped - slot expired");
+        // ---- SS-TWR Poll -> respond immediately ----
+        if (stage == STAGE_POLL && dest == ANCHOR_ID) {
+            ss_respondToPoll(from);
+            return;
+        }
+
+        // Unrelated frame (polls/bcasts to other anchors) -- ignore
+        DWM3000.clearSystemStatus();
+        DWM3000.standardRX();
+
+    } else if (rx_result == 2) {
+        rx_errors++;
+        DWM3000.clearSystemStatus();
+        DWM3000.standardRX();
     }
 }

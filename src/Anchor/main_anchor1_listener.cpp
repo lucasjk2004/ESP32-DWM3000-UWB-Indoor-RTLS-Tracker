@@ -69,6 +69,9 @@
 #define STAGE_FINAL    3
 #define STAGE_REPORT   4
 #define STAGE_BCAST    5
+#define STAGE_SYNC     6
+
+#define SYNC_INTERVAL_MS  2880   // 4 tags × 60ms × 12 cycles
 
 // ==================== GLOBALS ====================
 
@@ -84,14 +87,15 @@ int config[] = {
 
 static int curr_stage = 0;
 static int ranging_tag_id = -1;
-static int t_roundB = 0;
-static int t_replyB = 0;
+static long long t_roundB = 0;  // FIX: must be long long; DWM3000 timestamps overflow int32 after ~33ms
+static long long t_replyB = 0;  // FIX: same
 static long long anchor_rx = 0;
 static long long anchor_tx = 0;
 
 static unsigned long ranges_completed = 0;
 static unsigned long broadcasts_received = 0;
 static unsigned long rx_errors = 0;
+static unsigned long last_sync_ms = 0;
 
 // ==================== DWM3000 DRIVER ====================
 
@@ -100,7 +104,7 @@ public:
     static void begin(); static void init(); static void writeSysConfig();
     static void configureAsTX(); static void setupGPIO();
     static void ds_sendFrame(int stage);
-    static void ds_sendRTInfo(int trB, int trpB);
+    static void ds_sendRTInfo(long long trB, long long trpB);  // FIX: long long to match timestamp arithmetic
     static int  ds_getStage(); static bool ds_isErrorFrame();
     static void setMode(int mode); static void setFrameLength(int len);
     static void setTXAntennaDelay(int d);
@@ -141,7 +145,8 @@ void handleDataBroadcast() {
     float distances[NUM_ANCHORS];
     for (int i = 0; i < NUM_ANCHORS; i++) {
         uint32_t raw = DWM3000.read(RX_BUFFER_0_REG, 0x04 + (i * 2));
-        distances[i] = (raw & 0xFFFF) / 100.0;
+        // Tag sends tenths of cm; divide by 10 to recover cm with mm resolution
+        distances[i] = (raw & 0xFFFF) / 10.0;
     }
 
     float rssi[NUM_ANCHORS];
@@ -155,6 +160,30 @@ void handleDataBroadcast() {
     for (int i = 0; i < NUM_ANCHORS; i++) { Serial.print(","); Serial.print(distances[i], 3); }
     for (int i = 0; i < NUM_ANCHORS; i++) { Serial.print(","); Serial.print(rssi[i], 1); }
     Serial.println();
+}
+
+// ==================== SYNC BEACON ====================
+
+void sendSyncBeacon() {
+    DWM3000.forceIdle();
+    DWM3000.clearSystemStatus();
+    DWM3000.setMode(1);
+    DWM3000.write(TX_BUFFER_REG, 0x01, ANCHOR_ID & 0xFF);
+    DWM3000.write(TX_BUFFER_REG, 0x02, 0xFF);  // 0xFF = broadcast to all tags
+    DWM3000.write(TX_BUFFER_REG, 0x03, STAGE_SYNC & 0x7);
+    DWM3000.setFrameLength(4);
+    DWM3000.clearSystemStatus();
+    DWM3000.standardTX();
+    unsigned long t0 = millis();
+    while ((millis() - t0) < 10) {
+        if (DWM3000.sentFrameSucc()) break;
+        delayMicroseconds(100);
+    }
+    DWM3000.forceIdle();
+    DWM3000.clearSystemStatus();
+    DWM3000.standardRX();
+    last_sync_ms = millis();
+    Serial.println("# [SYNC] Beacon sent");
 }
 
 // ==================== DWM3000 IMPLEMENTATIONS ====================
@@ -244,7 +273,7 @@ void DWM3000Class::ds_sendFrame(int stage) {
     for (int i = 0; i < 50; i++) { if (sentFrameSucc()) return; }
 }
 
-void DWM3000Class::ds_sendRTInfo(int trB, int trpB) {
+void DWM3000Class::ds_sendRTInfo(long long trB, long long trpB) {  // FIX: long long
     setMode(1);
     write(TX_BUFFER_REG, 0x01, sender_id & 0xFF);
     write(TX_BUFFER_REG, 0x02, destination & 0xFF);
@@ -345,11 +374,18 @@ void setup() {
     for (int i = 0; i < NUM_ANCHORS; i++) { Serial.print(",rssi"); Serial.print(i); }
     Serial.println();
     Serial.println("# Ready");
+    delay(200);
+    sendSyncBeacon();
 }
 
 // ==================== MAIN LOOP ====================
 
 void loop() {
+    if ((millis() - last_sync_ms) >= SYNC_INTERVAL_MS) {
+        sendSyncBeacon();
+        return;
+    }
+
     int rx_result = DWM3000.receivedFrameSucc();
 
     if (rx_result == 1) {
