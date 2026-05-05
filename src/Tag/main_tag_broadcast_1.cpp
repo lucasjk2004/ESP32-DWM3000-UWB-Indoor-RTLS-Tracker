@@ -315,6 +315,7 @@ bool rangeWithAnchor(int idx) {
                 if (!DWM3000.ds_isErrorFrame() &&
                     DWM3000.ds_getStage() == STAGE_RESP &&
                     DWM3000.getSenderID() == aid) {
+                    a->signal_strength = DWM3000.getSignalStrength();
                     got_resp = true;
                 } else { stat_err++; }
                 break;
@@ -373,7 +374,6 @@ bool rangeWithAnchor(int idx) {
             a->clock_offset);
 
         a->distance = DWM3000.convertToCM(tof);
-        a->signal_strength = DWM3000.getSignalStrength();
         updateFilter(*a);
         stat_ok++;
 
