@@ -1,13 +1,19 @@
 // ============================================================
-//  UWB Spatial Tracking - LISTENER ANCHOR (Anchor 1)
-//  Plugged into computer via USB. Two jobs:
-//    1. Responds to DS-TWR polls from tags (like any anchor)
-//    2. Receives broadcast frames and outputs CSV over serial
+//  UWB Spatial Tracking - LISTENER ANCHOR (SET 1, CHANNEL 5)
 //
-//  CSV format: tag_id,dist0,dist1,dist2,dist3,rssi0,rssi1,rssi2,rssi3
-//  Lines starting with # are comments (ignored by parser)
+//  This is anchor 1, the listener for set 1.
+//  IDs:   anchors 1, 2, 3, 4 | tag 5
+//  RF:    UWB channel 5
 //
-//  Your Python/JSX visualization script reads this serial stream.
+//  USB-connected. Two jobs:
+//    1. Responds to DS-TWR polls from the tag (like any anchor)
+//    2. Receives the tag's broadcast frame and writes CSV to USB
+//
+//  CSV format:
+//    tag_id,dist1,dist2,dist3,dist4,rssi1,rssi2,rssi3,rssi4
+//  Lines starting with # are comments / status (ignored by parser).
+//
+//  Distances are in cm (float), RSSI in dBm.
 // ============================================================
 
 #include <Arduino.h>
@@ -19,8 +25,8 @@
 #define ANCHOR_ID           1
 #endif
 
-#define NUM_ANCHORS         6
-#define NUM_TAGS            4
+#define NUM_ANCHORS         4
+#define FIRST_ANCHOR_ID     1   // for CSV column naming
 
 #define RST_PIN             27
 #define CHIP_SELECT_PIN     4
@@ -133,6 +139,13 @@ private:
 DWM3000Class DWM3000;
 
 // ==================== BROADCAST HANDLER ====================
+// Parses the tag's broadcast frame and emits one CSV line.
+// Frame layout (offsets in RX buffer):
+//   [0x01]      sender (tag id)
+//   [0x02]      destination (= our ANCHOR_ID)
+//   [0x03]      stage (= STAGE_BCAST)
+//   [0x04..]    4 x uint16 distances (cm)
+//   [0x04 + 8]  4 x int16  RSSI * 100 (dBm)
 
 void handleDataBroadcast() {
     int tag_id = DWM3000.read(RX_BUFFER_0_REG, 0x01) & 0xFF;
@@ -150,7 +163,7 @@ void handleDataBroadcast() {
         rssi[i] = (int16_t)(raw & 0xFFFF) / 100.0;
     }
 
-    // CSV output: tag_id,d0,d1,d2,d3,rssi0,rssi1,rssi2,rssi3
+    // CSV: tag_id,dist1,dist2,dist3,dist4,rssi1,rssi2,rssi3,rssi4
     Serial.print(tag_id);
     for (int i = 0; i < NUM_ANCHORS; i++) { Serial.print(","); Serial.print(distances[i], 3); }
     for (int i = 0; i < NUM_ANCHORS; i++) { Serial.print(","); Serial.print(rssi[i], 1); }
@@ -163,11 +176,11 @@ void DWM3000Class::spiSelect(uint8_t cs) { pinMode(cs, OUTPUT); digitalWrite(cs,
 void DWM3000Class::begin() { delay(5); pinMode(CHIP_SELECT_PIN, OUTPUT); SPI.begin(); delay(5); spiSelect(CHIP_SELECT_PIN); }
 
 void DWM3000Class::init() {
-    if (!checkForDevID()) { Serial.println("[ERROR] Dev ID wrong!"); return; }
+    if (!checkForDevID()) { Serial.println("# [ERROR] Dev ID wrong!"); return; }
     setBitHigh(GEN_CFG_AES_LOW_REG, 0x10, 4);
-    while (!checkForIDLE()) { Serial.println("[WARN] IDLE failed (1)"); delay(100); }
+    while (!checkForIDLE()) { Serial.println("# [WARN] IDLE failed (1)"); delay(100); }
     softReset(); delay(200);
-    while (!checkForIDLE()) { Serial.println("[WARN] IDLE failed (2)"); delay(100); }
+    while (!checkForIDLE()) { Serial.println("# [WARN] IDLE failed (2)"); delay(100); }
     uint32_t ldo_low = readOTP(0x04); uint32_t ldo_high = readOTP(0x05);
     uint32_t bias_tune = (readOTP(0xA) >> 16) & BIAS_CTRL_BIAS_MASK;
     if (ldo_low && ldo_high && bias_tune) { write(0x11, 0x1F, bias_tune); write(0x0B, 0x08, 0x0100); }
@@ -186,7 +199,7 @@ void DWM3000Class::init() {
     write(0x07, 0x1A, 0x0E); write(0x07, 0x1C, 0x1C071134);
     write(0x09, 0x00, 0x1F3C); write(0x09, 0x80, 0x81);
     write(0x11, 0x04, 0xB40200); write(0x11, 0x08, 0x80030738);
-    Serial.println("[OK] DWM3000 init complete");
+    Serial.println("# [OK] DWM3000 init complete");
 }
 
 void DWM3000Class::writeSysConfig() {
@@ -213,7 +226,7 @@ void DWM3000Class::writeSysConfig() {
     write(PMSC_REG, 0x04, 0x300200); write(PMSC_REG, 0x08, 0x0138);
     int ok = 0;
     for (int i = 0; i < 100; i++) { if (read(GEN_CFG_AES_LOW_REG, 0x0) & 0x2) { ok = 1; break; } }
-    if (!ok) Serial.println("[ERROR] PLL lock failed!");
+    if (!ok) Serial.println("# [ERROR] PLL lock failed!");
     int otp_val = read(OTP_IF_REG, 0x08); otp_val |= 0x40;
     if (config[0]) otp_val |= 0x2000;
     write(OTP_IF_REG, 0x08, otp_val); write(RX_TUNE_REG, 0x19, 0xF0);
@@ -223,10 +236,10 @@ void DWM3000Class::writeSysConfig() {
     write(EXT_SYNC_REG, 0x0C, 0x11);
     int succ = 0;
     for (int i = 0; i < 100; i++) { if (read(EXT_SYNC_REG, 0x20)) { succ = 1; break; } delay(10); }
-    if (!succ) Serial.println("[ERROR] PGF cal failed!");
+    if (!succ) Serial.println("# [ERROR] PGF cal failed!");
     write(EXT_SYNC_REG, 0x0C, 0x00); write(EXT_SYNC_REG, 0x20, 0x01);
-    if (read(EXT_SYNC_REG, 0x14) == 0x1fffffff) Serial.println("[ERROR] PGF I fail!");
-    if (read(EXT_SYNC_REG, 0x1C) == 0x1fffffff) Serial.println("[ERROR] PGF Q fail!");
+    if (read(EXT_SYNC_REG, 0x14) == 0x1fffffff) Serial.println("# [ERROR] PGF I fail!");
+    if (read(EXT_SYNC_REG, 0x1C) == 0x1fffffff) Serial.println("# [ERROR] PGF Q fail!");
     write(RF_CONF_REG, 0x48, ldo_ctrl); write(0x0E, 0x02, 0x01);
     setTXAntennaDelay(ANTENNA_DELAY);
 }
@@ -317,14 +330,14 @@ uint32_t DWM3000Class::sendBytes(int b[], int lenB, int recLen) {
 
 void DWM3000Class::clearAONConfig() { write(AON_REG, NO_OFFSET, 0x00, 2); write(AON_REG, 0x14, 0x00, 1); write(AON_REG, 0x04, 0x00, 1); write(AON_REG, 0x04, 0x02); delay(1); }
 unsigned int DWM3000Class::countBits(unsigned int n) { return (int)log2(n) + 1; }
-int DWM3000Class::checkForDevID() { int res = read(GEN_CFG_AES_LOW_REG, NO_OFFSET); if (res != 0xDECA0302 && res != 0xDECA0312) { Serial.println("[ERROR] DEV_ID wrong!"); return 0; } return 1; }
+int DWM3000Class::checkForDevID() { int res = read(GEN_CFG_AES_LOW_REG, NO_OFFSET); if (res != 0xDECA0302 && res != 0xDECA0312) { Serial.println("# [ERROR] DEV_ID wrong!"); return 0; } return 1; }
 
 // ==================== SETUP ====================
 
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.println("# UWB Listener Anchor");
+    Serial.println("# UWB Listener Anchor (Set 1, Channel 5)");
     Serial.print("# Anchor ID: "); Serial.println(ANCHOR_ID);
 
     DWM3000.begin(); DWM3000.hardReset(); delay(200);
@@ -340,9 +353,10 @@ void setup() {
     DWM3000.clearSystemStatus();
     DWM3000.standardRX();
 
+    // CSV header (numbered by anchor ID)
     Serial.print("# CSV: tag_id");
-    for (int i = 0; i < NUM_ANCHORS; i++) { Serial.print(",dist"); Serial.print(i); }
-    for (int i = 0; i < NUM_ANCHORS; i++) { Serial.print(",rssi"); Serial.print(i); }
+    for (int i = 0; i < NUM_ANCHORS; i++) { Serial.print(",dist"); Serial.print(i + FIRST_ANCHOR_ID); }
+    for (int i = 0; i < NUM_ANCHORS; i++) { Serial.print(",rssi"); Serial.print(i + FIRST_ANCHOR_ID); }
     Serial.println();
     Serial.println("# Ready");
 }
@@ -399,7 +413,7 @@ void loop() {
             return;
         }
 
-        // Unrelated frame (e.g. polls to other anchors)
+        // Unrelated frame
         DWM3000.clearSystemStatus();
         DWM3000.standardRX();
 

@@ -1,13 +1,23 @@
 // ============================================================
-//  UWB Spatial Tracking - TAG Firmware (Multi-Tag TDMA)
+//  UWB Spatial Tracking - TAG Firmware (SET 1, CHANNEL 5)
 //
-//  Tags are powered externally (USB/battery). They:
-//    1. Range with each anchor via DS-TWR
-//    2. Broadcast all distances in one UWB frame to anchor 1
-//    3. Anchor 1 (listener) outputs CSV over serial to computer
+//  IDs:   anchors 1, 2, 3, 4 | tag 5 | listener = anchor 1
+//  RF:    UWB channel 5
 //
-//  FLASH: Same file for all tags. Set TAG_ID via build_flags.
-//  SYSTEM CONFIG must match across all devices.
+//  1 tag + 4 anchors (1 listener + 3 dumb), no TDMA. The tag
+//  ranges with each anchor in a tight loop and broadcasts the
+//  four distances to the listener (anchor 1) which streams
+//  them as CSV over USB serial.
+//
+//  Cycle:
+//    1. DS-TWR with anchor 1 (listener), then 2, 3, 4
+//    2. Broadcast [tag_id, d1..d4, rssi1..rssi4] to anchor 1
+//    3. Optional inter-cycle delay (CYCLE_DELAY_MS)
+//
+//  All three firmwares in this set (tag, listener, dumb) must
+//  agree on channel and antenna delay. Set 2 (channel 9,
+//  anchors 6-9, tag 10) runs concurrently on a different channel
+//  and does not interfere.
 // ============================================================
 
 #include <Arduino.h>
@@ -16,26 +26,26 @@
 // ==================== CONFIGURATION ====================
 
 #ifndef TAG_ID
-#define TAG_ID              10
+#define TAG_ID              5
 #endif
 
-#define NUM_ANCHORS         6
+#define NUM_ANCHORS         4
 #define FIRST_ANCHOR_ID     1
 #define LISTENER_ANCHOR_ID  1
-#define NUM_TAGS            4
-#define FIRST_TAG_ID        7
 
 #define RST_PIN             27
 #define CHIP_SELECT_PIN     4
 
 #define RX_TIMEOUT_MS       10
-#define INTER_RANGE_DELAY   2
-#define SLOT_DURATION_MS    100
+#define INTER_RANGE_DELAY   2     // ms between anchors in a cycle
+#define CYCLE_DELAY_MS      0     // ms between full ranging cycles (0 = run flat-out)
 #define MAX_RANGE_RETRIES   1
 
 #define FILTER_SIZE         5
 #define MIN_DISTANCE        0.0
 #define MAX_DISTANCE        2000.0
+
+#define STATS_PRINT_MS      2000  // print [STATS] every N ms (0 to disable)
 
 // ==================== UWB CONSTANTS ====================
 
@@ -94,14 +104,13 @@ int config[] = {
     DATARATE_6_8MB, PHR_MODE_STANDARD, PHR_RATE_850KB
 };
 
-static int my_slot = 0;
-static unsigned long slot_start_ms = 0;
-
 static unsigned long stat_attempts = 0;
 static unsigned long stat_ok = 0;
 static unsigned long stat_timeout = 0;
 static unsigned long stat_err = 0;
 static unsigned long stat_bcast = 0;
+static unsigned long stat_cycles = 0;
+static unsigned long last_stats_ms = 0;
 
 // ==================== ANCHOR DATA ====================
 
@@ -147,23 +156,6 @@ void updateFilter(AnchorData &a) {
             valid[cnt++] = a.distance_history[i];
     a.filtered_distance = (cnt > 0) ? calcMedian(valid, cnt) : 0;
 }
-
-// ==================== TDMA ====================
-
-void waitForSlot() {
-    unsigned long cycle = (unsigned long)NUM_TAGS * SLOT_DURATION_MS;
-    unsigned long now = millis();
-    unsigned long pos = now % cycle;
-    unsigned long my_start = (unsigned long)my_slot * SLOT_DURATION_MS;
-    unsigned long wait = 0;
-    if (pos <= my_start) wait = my_start - pos;
-    else if (pos < my_start + SLOT_DURATION_MS) wait = 0;
-    else wait = cycle - pos + my_start;
-    if (wait > 0) delay(wait);
-    slot_start_ms = millis();
-}
-
-bool slotExpired() { return (millis() - slot_start_ms) >= SLOT_DURATION_MS; }
 
 // ==================== DWM3000 DRIVER ====================
 
@@ -226,33 +218,32 @@ DWM3000Class DWM3000;
 
 bool rangeWithAnchor(int idx);
 void broadcastDistances();
+void maybePrintStats();
 
 // ==================== BROADCAST ====================
-// KEY FIX: Use standardTX() for broadcast (fire-and-forget).
-// The old code used TXInstantRX() which auto-transitions to RX after TX.
-// But after the last failed ranging attempt, the radio was left in a
-// bad RX state that prevented TXInstantRX from working. standardTX()
-// just transmits and stops, which is what we want for a broadcast.
-// The listener is already in RX mode waiting.
+// Uses standardTX() (fire-and-forget) rather than TXInstantRX().
+// The listener stays in RX continuously and will pick it up.
+// Frame layout: [mode][sender=TAG_ID][dest=LISTENER][stage=BCAST]
+//               [d0_lo d0_hi ... d3_lo d3_hi]      (4 * 2 = 8 bytes)
+//               [r0_lo r0_hi ... r3_lo r3_hi]      (4 * 2 = 8 bytes)
 
 void broadcastDistances() {
-    // Full reset to clean state
     DWM3000.forceIdle();
     delay(2);
     DWM3000.clearSystemStatus();
     delay(1);
 
-    // Build the frame
     DWM3000.setMode(1);
     DWM3000.write(TX_BUFFER_REG, 0x01, TAG_ID & 0xFF);
     DWM3000.write(TX_BUFFER_REG, 0x02, LISTENER_ANCHOR_ID & 0xFF);
     DWM3000.write(TX_BUFFER_REG, 0x03, STAGE_BCAST & 0x7);
 
+    // Distances (cm, stored as uint16 * 1)
     for (int i = 0; i < NUM_ANCHORS; i++) {
         uint16_t d = (uint16_t)(anchors[i].filtered_distance);
         DWM3000.write(TX_BUFFER_REG, 0x04 + (i * 2), d, 2);
     }
-
+    // RSSI (dBm * 100, signed int16)
     for (int i = 0; i < NUM_ANCHORS; i++) {
         int16_t r = (int16_t)(anchors[i].signal_strength * 100);
         DWM3000.write(TX_BUFFER_REG, 0x04 + (NUM_ANCHORS * 2) + (i * 2), (uint16_t)r, 2);
@@ -260,13 +251,9 @@ void broadcastDistances() {
 
     DWM3000.setFrameLength(3 + NUM_ANCHORS * 4);
 
-    // Clear status bits RIGHT before TX
     DWM3000.clearSystemStatus();
-
-    // Use standardTX (not TXInstantRX) - just send and stop
     DWM3000.standardTX();
 
-    // Poll for TX complete
     bool ok = false;
     unsigned long t0 = millis();
     while ((millis() - t0) < 15) {
@@ -274,12 +261,8 @@ void broadcastDistances() {
         delayMicroseconds(100);
     }
 
-    if (ok) {
-        stat_bcast++;
-        Serial.println("[BCAST] OK");
-    } else {
-        Serial.println("[BCAST] FAIL");
-    }
+    if (ok) stat_bcast++;
+    else    Serial.println("[BCAST] FAIL");
 
     DWM3000.forceIdle();
     DWM3000.clearSystemStatus();
@@ -315,7 +298,6 @@ bool rangeWithAnchor(int idx) {
                 if (!DWM3000.ds_isErrorFrame() &&
                     DWM3000.ds_getStage() == STAGE_RESP &&
                     DWM3000.getSenderID() == aid) {
-                    a->signal_strength = DWM3000.getSignalStrength();
                     got_resp = true;
                 } else { stat_err++; }
                 break;
@@ -374,12 +356,9 @@ bool rangeWithAnchor(int idx) {
             a->clock_offset);
 
         a->distance = DWM3000.convertToCM(tof);
+        a->signal_strength = DWM3000.getSignalStrength();
         updateFilter(*a);
         stat_ok++;
-
-        Serial.print("[DIST] A"); Serial.print(aid);
-        Serial.print(": "); Serial.print(a->filtered_distance, 1);
-        Serial.println("cm");
 
         DWM3000.forceIdle();
         DWM3000.clearSystemStatus();
@@ -389,6 +368,26 @@ bool rangeWithAnchor(int idx) {
     DWM3000.forceIdle();
     DWM3000.clearSystemStatus();
     return false;
+}
+
+// ==================== STATS ====================
+
+void maybePrintStats() {
+    if (STATS_PRINT_MS == 0) return;
+    unsigned long now = millis();
+    if (now - last_stats_ms < STATS_PRINT_MS) return;
+    last_stats_ms = now;
+    Serial.print("[STATS] cycles="); Serial.print(stat_cycles);
+    Serial.print(" ok=");     Serial.print(stat_ok);
+    Serial.print(" to=");     Serial.print(stat_timeout);
+    Serial.print(" err=");    Serial.print(stat_err);
+    Serial.print(" bcast=");  Serial.print(stat_bcast);
+    Serial.print(" | last:");
+    for (int i = 0; i < NUM_ANCHORS; i++) {
+        Serial.print(" A"); Serial.print(anchors[i].anchor_id); Serial.print("=");
+        Serial.print(anchors[i].filtered_distance, 0);
+    }
+    Serial.println();
 }
 
 // ==================== DWM3000 IMPLEMENTATIONS ====================
@@ -569,10 +568,8 @@ int DWM3000Class::checkForDevID() { int res = read(GEN_CFG_AES_LOW_REG, NO_OFFSE
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.println("\n=== UWB Tag (TDMA) ===");
+    Serial.println("\n=== UWB Tag (Set 1, Channel 5) ===");
     Serial.print("Tag ID: "); Serial.println(TAG_ID);
-    my_slot = TAG_ID - FIRST_TAG_ID;
-    Serial.print("Slot: "); Serial.print(my_slot); Serial.print("/"); Serial.println(NUM_TAGS);
     initAnchors();
     DWM3000.begin(); DWM3000.hardReset(); delay(200);
     if (!DWM3000.checkSPI()) { Serial.println("[FATAL] SPI failed"); while (1); }
@@ -590,12 +587,12 @@ void setup() {
 // ==================== MAIN LOOP ====================
 
 void loop() {
-    waitForSlot();
     for (int a = 0; a < NUM_ANCHORS; a++) {
-        if (slotExpired()) break;
         rangeWithAnchor(a);
-        delay(INTER_RANGE_DELAY);
+        if (INTER_RANGE_DELAY > 0) delay(INTER_RANGE_DELAY);
     }
-    if (!slotExpired()) broadcastDistances();
-    else Serial.println("[BCAST] Slot expired");
+    broadcastDistances();
+    stat_cycles++;
+    maybePrintStats();
+    if (CYCLE_DELAY_MS > 0) delay(CYCLE_DELAY_MS);
 }

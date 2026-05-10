@@ -1,7 +1,15 @@
 // ============================================================
-//  UWB Spatial Tracking - RESPONDER ANCHOR (Anchors 2, 3, 4)
+//  UWB Spatial Tracking - DUMB ANCHOR (SET 1, CHANNEL 5)
+//
+//  Dumb responders for set 1: anchors 2, 3, 4.
+//  RF:    UWB channel 5
 //  DS-TWR responder only. Ignores broadcast frames.
-//  Flash same file, set ANCHOR_ID via build_flags: -DANCHOR_ID=2
+//
+//  Flash this same file to anchors 2, 3, and 4. Set ANCHOR_ID
+//  per board via build_flags, e.g.:
+//      -DANCHOR_ID=2   (or 3, or 4)
+//
+//  Anchor 1 (the listener) uses a separate file.
 // ============================================================
 
 #include <Arduino.h>

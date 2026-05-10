@@ -1,14 +1,22 @@
 // ============================================================
-//  UWB Spatial Tracking - RESPONDER ANCHOR (Anchors 2, 3, 4)
+//  UWB Spatial Tracking - DUMB ANCHOR (SET 2, CHANNEL 9)
+//
+//  Dumb responders for set 2: anchors 7, 8, 9.
+//  RF:    UWB channel 9
 //  DS-TWR responder only. Ignores broadcast frames.
-//  Flash same file, set ANCHOR_ID via build_flags: -DANCHOR_ID=2
+//
+//  Flash this same file to anchors 7, 8, and 9. Set ANCHOR_ID
+//  per board via build_flags, e.g.:
+//      -DANCHOR_ID=7   (or 8, or 9)
+//
+//  Anchor 6 (the listener) uses a separate file.
 // ============================================================
 
 #include <Arduino.h>
 #include <SPI.h>
 
 #ifndef ANCHOR_ID
-#define ANCHOR_ID           6
+#define ANCHOR_ID           8
 #endif
 
 #define RST_PIN             27
@@ -61,7 +69,7 @@ static int ANTENNA_DELAY = 16350;
 int led_status = 0;
 int destination = 0x0;
 int sender_id = 0x0;
-int config[] = { CHANNEL_5, PREAMBLE_128, 9, PAC8, DATARATE_6_8MB, PHR_MODE_STANDARD, PHR_RATE_850KB };
+int config[] = { CHANNEL_9, PREAMBLE_128, 9, PAC8, DATARATE_6_8MB, PHR_MODE_STANDARD, PHR_RATE_850KB };
 
 static int curr_stage = 0;
 static int ranging_tag_id = -1;
