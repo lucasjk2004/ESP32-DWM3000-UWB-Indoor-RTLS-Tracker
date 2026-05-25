@@ -22,6 +22,7 @@
 
 #include <Arduino.h>
 #include <SPI.h>
+#include <Adafruit_NeoPixel.h>
 
 // ==================== CONFIGURATION ====================
 
@@ -46,6 +47,22 @@
 #define MAX_DISTANCE        2000.0
 
 #define STATS_PRINT_MS      2000  // print [STATS] every N ms (0 to disable)
+
+// ==================== LED STRIP CONFIG ====================
+// For 5V addressable BTF strips such as WS2812B / SK6812 / NeoPixel.
+// Wiring: power bank 5V -> strip 5V, power bank GND -> strip GND,
+// ESP32 GND -> strip GND, ESP32 GPIO26 -> strip DIN.
+#define LED_PIN             26
+#define NUM_LEDS            30      // change to your actual strip length
+#define LED_BRIGHTNESS      80      // keep modest if powering from a small power bank
+
+#define CLOSE_CM            50.0f   // <= 0.5 m: red/bright
+#define FAR_CM              400.0f  // >= 4.0 m: blue/dimmer
+#define INVALID_IDLE_R      20
+#define INVALID_IDLE_G      0
+#define INVALID_IDLE_B      30
+
+Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // ==================== UWB CONSTANTS ====================
 
@@ -219,6 +236,7 @@ DWM3000Class DWM3000;
 bool rangeWithAnchor(int idx);
 void broadcastDistances();
 void maybePrintStats();
+void updateLEDFromNearestAnchor();
 
 // ==================== BROADCAST ====================
 // Uses standardTX() (fire-and-forget) rather than TXInstantRX().
@@ -563,6 +581,67 @@ void DWM3000Class::clearAONConfig() { write(AON_REG, NO_OFFSET, 0x00, 2); write(
 unsigned int DWM3000Class::countBits(unsigned int n) { return (int)log2(n) + 1; }
 int DWM3000Class::checkForDevID() { int res = read(GEN_CFG_AES_LOW_REG, NO_OFFSET); if (res != 0xDECA0302 && res != 0xDECA0312) { Serial.println("[ERROR] DEV_ID wrong!"); return 0; } return 1; }
 
+
+// ==================== LED DISTANCE VISUALIZATION ====================
+
+float clampFloat(float x, float lo, float hi) {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
+uint32_t colorFromDistance(float cm) {
+    // t = 0.0 means close, t = 1.0 means far.
+    float t = clampFloat((cm - CLOSE_CM) / (FAR_CM - CLOSE_CM), 0.0f, 1.0f);
+
+    // Close -> red, middle -> green, far -> blue.
+    uint8_t r = 0, g = 0, b = 0;
+
+    if (t < 0.5f) {
+        float u = t / 0.5f;
+        r = (uint8_t)(255.0f * (1.0f - u));
+        g = (uint8_t)(255.0f * u);
+        b = 0;
+    } else {
+        float u = (t - 0.5f) / 0.5f;
+        r = 0;
+        g = (uint8_t)(255.0f * (1.0f - u));
+        b = (uint8_t)(255.0f * u);
+    }
+
+    return strip.Color(r, g, b);
+}
+
+void updateLEDFromNearestAnchor() {
+    float nearest = 99999.0f;
+    int nearestAnchorID = -1;
+
+    for (int i = 0; i < NUM_ANCHORS; i++) {
+        float d = anchors[i].filtered_distance;
+
+        // Ignore invalid/uninitialized readings.
+        if (d > 1.0f && d < MAX_DISTANCE && d < nearest) {
+            nearest = d;
+            nearestAnchorID = anchors[i].anchor_id;
+        }
+    }
+
+    if (nearestAnchorID < 0) {
+        strip.setBrightness(LED_BRIGHTNESS);
+        strip.fill(strip.Color(INVALID_IDLE_R, INVALID_IDLE_G, INVALID_IDLE_B));
+        strip.show();
+        return;
+    }
+
+    // Make it brighter as the tag gets closer to the nearest anchor.
+    float closeness = 1.0f - clampFloat((nearest - CLOSE_CM) / (FAR_CM - CLOSE_CM), 0.0f, 1.0f);
+    uint8_t dynamicBrightness = (uint8_t)(30.0f + closeness * 180.0f);
+
+    strip.setBrightness(dynamicBrightness);
+    strip.fill(colorFromDistance(nearest));
+    strip.show();
+}
+
 // ==================== SETUP ====================
 
 void setup() {
@@ -581,6 +660,12 @@ void setup() {
     DWM3000.setSenderID(TAG_ID);
     DWM3000.configureAsTX();
     DWM3000.clearSystemStatus();
+
+    strip.begin();
+    strip.setBrightness(LED_BRIGHTNESS);
+    strip.fill(strip.Color(0, 0, 20));
+    strip.show();
+
     Serial.println("[OK] Tag ready\n");
 }
 
@@ -591,6 +676,8 @@ void loop() {
         rangeWithAnchor(a);
         if (INTER_RANGE_DELAY > 0) delay(INTER_RANGE_DELAY);
     }
+    updateLEDFromNearestAnchor();
+
     broadcastDistances();
     stat_cycles++;
     maybePrintStats();
